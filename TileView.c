@@ -57,6 +57,7 @@ typedef struct {
     BOOL vertical;
     int *separators, separator_count;
     BOOL samples;
+    int *bands;                 /* per history tile: vertical layout = column index, horizontal layout = row (grows downwards) */
 } TILE_VIEW;
 
 static int tile_scale(HWND window, int value)
@@ -272,6 +273,7 @@ static void tile_clear(TILE_VIEW *view)
     view->line_count = 0;
     mem_free(&view->paint_order);
     mem_free(&view->separators);
+    mem_free(&view->bands);
     view->separator_count = 0;
     view->count = 0;
 }
@@ -467,6 +469,8 @@ static void tile_layout_vertical(HWND window, TILE_VIEW *view, const RECT *clien
 
     ZeroMemory(columns, sizeof(columns));
     mem_free(&view->separators);
+    mem_free(&view->bands);
+    view->bands = view->count ? mem_calloc(view->count * sizeof(int)) : NULL;
     view->separator_count = 0;
     view->position_count = 0;
     mem_free(&view->lines);
@@ -545,6 +549,7 @@ static void tile_layout_vertical(HWND window, TILE_VIEW *view, const RECT *clien
             }
             column->continued = FALSE;
             SetRect(&entry->bounds, column->x, column->y, column->x + min(width, column->width), column->y + height);
+            if (view->bands != NULL) view->bands[index] = text_current;
             column->y += height + text_gap;
         } else {
             int span_width, span_height, row, cell_column, check, group_y, group_row;
@@ -592,6 +597,7 @@ static void tile_layout_vertical(HWND window, TILE_VIEW *view, const RECT *clien
             x = column->x + cell_column * pitch;
             bottom = column->group_y + (row - column->group_row) * pitch;
             SetRect(&entry->bounds, x, bottom, x + span_width * pitch - gap, bottom + span_height * pitch - gap);
+            if (view->bands != NULL) view->bands[index] = image_current;
         }
     }
 
@@ -744,6 +750,8 @@ static void tile_layout(HWND window, TILE_VIEW *view)
         view->occupied[1] = occupied[1];
         view->current_span = current_span;
         mem_free(&view->separators);
+        mem_free(&view->bands);
+        view->bands = view->count ? mem_calloc(view->count * sizeof(int)) : NULL;
         view->separators = view->count ? mem_alloc(view->count * sizeof(int)) : NULL;
         view->separator_count = 0;
         for (sequence = 0; sequence < view->count; sequence++) {
@@ -758,6 +766,7 @@ static void tile_layout(HWND window, TILE_VIEW *view)
                 view->separators[view->separator_count++] =
                     margin + end - (position->row_top - gap / 2) + tile_scale(window, 28);
             }
+            if (view->bands != NULL) view->bands[view->count - 1 - sequence] = -position->row_top;
             SetRectEmpty(&entry->divider);
             if (sequence + 1 == view->count || !IsRectEmpty(&view->positions[sequence + 1].divider)) {
                 int group_end = sequence + 1 == view->count ? end : view->positions[sequence + 1].divider.top - gap;
@@ -1144,6 +1153,126 @@ static void tile_paint(HWND window, TILE_VIEW *view, HDC target)
     DeleteDC(context);
 }
 
+static int tile_range_gap(int first_low, int first_high, int second_low, int second_high)
+{
+    return max(0, max(first_low, second_low) - min(first_high, second_high));
+}
+
+/*
+ * Favorites/samples arrow-key target: the nearest tile on screen in that direction (the "+" panels follow the clips,
+ * so list order says nothing about the screen position).
+ */
+static int tile_neighbor(const TILE_VIEW *view, WPARAM key)
+{
+    const RECT *from = &view->entries[view->selected].bounds;
+    BOOL horizontal = key == VK_LEFT || key == VK_RIGHT;
+    BOOL forward = key == VK_RIGHT || key == VK_DOWN;
+    int from_x = (from->left + from->right) / 2, from_y = (from->top + from->bottom) / 2;
+    int best = -1, best_cost = INT_MAX, index;
+    for (index = 0; index < view->count; index++) {
+        const RECT *to = &view->entries[index].bounds;
+        int to_x = (to->left + to->right) / 2, to_y = (to->top + to->bottom) / 2;
+        int along, across, cost;
+        if (index == view->selected || IsRectEmpty(to)) continue;
+        if (horizontal) {
+            if (forward ? !(to->left > from->left && to_x > from_x) : !(to->left < from->left && to_x < from_x)) continue;
+            along = forward ? max(0, to->left - from->right) : max(0, from->left - to->right);
+            across = tile_range_gap(from->top, from->bottom, to->top, to->bottom);
+            cost = along + across * 4 + abs(to_y - from_y) / 2;
+        } else {
+            if (forward ? !(to->top > from->top && to_y > from_y) : !(to->top < from->top && to_y < from_y)) continue;
+            along = forward ? max(0, to->top - from->bottom) : max(0, from->top - to->bottom);
+            across = tile_range_gap(from->left, from->right, to->left, to->right);
+            cost = along + across * 4 + abs(to_x - from_x) / 2;
+        }
+        if (cost < best_cost) {
+            best_cost = cost;
+            best = index;
+        }
+    }
+    return best;
+}
+
+/*
+ * History arrow-key target. The clips are stored newest first. Vertical layout: Up/Down walk the clips in time order
+ * (Up = newer, Down = older), Left/Right jump to the neighbouring column. Horizontal layout: Left/Right walk the
+ * clips in time order (Left = newer, Right = older), Up/Down jump to the neighbouring row. Nothing wraps around.
+ */
+static int tile_history_neighbor(const TILE_VIEW *view, WPARAM key)
+{
+    const RECT *from = &view->entries[view->selected].bounds;
+    BOOL by_time = view->vertical ? key == VK_UP || key == VK_DOWN : key == VK_LEFT || key == VK_RIGHT;
+    BOOL forward = key == VK_DOWN || key == VK_RIGHT;
+    int from_x = (from->left + from->right) / 2, from_y = (from->top + from->bottom) / 2;
+    int from_band, target_band = 0, best = -1, best_cost = INT_MAX, index;
+    BOOL found = FALSE;
+    if (by_time) {
+        int next = view->selected + (forward ? 1 : -1);
+        return next >= 0 && next < view->count ? next : -1;
+    }
+    if (view->bands == NULL) return -1;
+    from_band = view->bands[view->selected];
+    for (index = 0; index < view->count; index++) {
+        int band = view->bands[index];
+        if (IsRectEmpty(&view->entries[index].bounds) || (forward ? band <= from_band : band >= from_band)) continue;
+        if (!found || (forward ? band < target_band : band > target_band)) {
+            target_band = band;
+            found = TRUE;
+        }
+    }
+    for (index = 0; found && index < view->count; index++) {
+        const RECT *to = &view->entries[index].bounds;
+        int to_x = (to->left + to->right) / 2, to_y = (to->top + to->bottom) / 2;
+        /* keep the position across the band: the same height between columns, the same x between rows */
+        int cost = view->vertical ? abs(to_y - from_y) * 16 + abs(to_x - from_x) :
+            abs(to_x - from_x) * 16 + abs(to_y - from_y);
+        if (IsRectEmpty(to) || view->bands[index] != target_band) continue;
+        if (cost < best_cost) {
+            best_cost = cost;
+            best = index;
+        }
+    }
+    return best;
+}
+
+/* Scrolls only when the selected tile is not completely on screen, and only as far as needed. */
+static void tile_reveal(HWND window, TILE_VIEW *view)
+{
+    RECT client;
+    const RECT *bounds = &view->entries[view->selected].bounds;
+    int top_margin = tile_scale(window, 40), bottom_margin = tile_scale(window, 12);
+    GetClientRect(window, &client);
+    if (bounds->top < view->offset) view->offset = bounds->top - top_margin;
+    else if (bounds->bottom > view->offset + client.bottom) view->offset = bounds->bottom + bottom_margin - client.bottom;
+    else return;
+    view->offset = max(0, min(view->offset, view->height - client.bottom));
+    SetScrollPos(window, SB_VERT, view->offset, TRUE);
+    view->offset = GetScrollPos(window, SB_VERT);
+}
+
+/* Moves the keyboard focus here (from the search box). Without a selection, the first fully visible clip is selected. */
+void tileview_focus(HWND window)
+{
+    TILE_VIEW *view = (TILE_VIEW *)GetWindowLongPtr(window, GWLP_USERDATA);
+    RECT client;
+    int index;
+    if (view == NULL) return;
+    SetFocus(window);
+    if (view->count > 0 && (view->selected < 0 || view->selected >= view->count)) {
+        GetClientRect(window, &client);
+        view->selected = 0;
+        for (index = 0; index < view->count; index++) {
+            const RECT *bounds = &view->entries[index].bounds;
+            if (!IsRectEmpty(bounds) && bounds->top >= view->offset && bounds->bottom <= view->offset + client.bottom) {
+                view->selected = index;
+                break;
+            }
+        }
+        tile_reveal(window, view);
+    }
+    InvalidateRect(window, NULL, FALSE);
+}
+
 static LRESULT CALLBACK tile_proc(HWND window, UINT message, WPARAM parameter, LPARAM data)
 {
     TILE_VIEW *view = (TILE_VIEW *)GetWindowLongPtr(window, GWLP_USERDATA);
@@ -1241,20 +1370,33 @@ static LRESULT CALLBACK tile_proc(HWND window, UINT message, WPARAM parameter, L
         return 0;
     case WM_KEYDOWN:
         if (parameter == VK_UP || parameter == VK_LEFT || parameter == VK_DOWN || parameter == VK_RIGHT) {
-            view->selected = max(0, min(view->count - 1, view->selected +
-                (parameter == VK_UP || parameter == VK_LEFT ? -1 : 1)));
-            if (view->selected < view->count) {
-                RECT client;
-                GetClientRect(window, &client);
-                view->offset = max(0, min(view->entries[view->selected].bounds.top,
-                    view->height - client.bottom));
-                SetScrollPos(window, SB_VERT, view->offset, TRUE);
+            if (view->count > 0) {
+                int next = view->selected >= 0 && view->selected < view->count ?
+                    (view->favorites ? tile_neighbor(view, parameter) : tile_history_neighbor(view, parameter)) : 0;
+                if (next >= 0 && next != view->selected) {
+                    view->selected = next;
+                    tile_reveal(window, view);
+                }
+                InvalidateRect(window, NULL, FALSE);
             }
-            InvalidateRect(window, NULL, FALSE);
             return 0;
         }
         if (parameter == VK_RETURN && view->selected >= 0 && view->selected < view->count) {
             TILE_ENTRY *entry = &view->entries[view->selected];
+            if (!view->favorites) {
+                /* History: copy the clip, i.e. it becomes the newest clip. The list is rebuilt, so find it again. */
+                DATA_INFO *item = entry->item;
+                SendMessage(GetParent(window), WM_TILE_COPY, entry->kind, (LPARAM)item);
+                for (index = 0; index < view->count; index++) {
+                    if (view->entries[index].item == item) {
+                        view->selected = index;
+                        tile_reveal(window, view);
+                        break;
+                    }
+                }
+                InvalidateRect(window, NULL, FALSE);
+                return 0;
+            }
             return SendMessage(GetParent(window), view->samples ? (entry->item == NULL ? WM_TILE_DEBUG_NEW : WM_TILE_SAMPLE) :
                 entry->item == NULL ? WM_TILE_NEW : WM_TILE_PASTE, entry->kind, (LPARAM)entry->item);
         }
