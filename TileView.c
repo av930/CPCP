@@ -1128,9 +1128,19 @@ static void tile_paint(HWND window, TILE_VIEW *view, HDC target)
             DrawText(context, label, -1, &badge, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
             RestoreDC(context, -1);
         }
-        if (index == view->selected && GetFocus() == window) {
-            InflateRect(&bounds, -3, -3);
-            DrawFocusRect(context, &bounds);
+        if (index == view->selected) {
+            /* Thick highlight frame, drawn last so the content cannot cover it. */
+            RECT frame = bounds;
+            int thickness = tile_scale(window, 3), line;
+            HBRUSH highlight = dark_mode_get_brush(COLOR_HIGHLIGHT);
+            for (line = 0; line < thickness; line++) {
+                FrameRect(context, &frame, highlight);
+                InflateRect(&frame, -1, -1);
+            }
+            if (GetFocus() == window) {
+                InflateRect(&bounds, -(thickness + 1), -(thickness + 1));
+                DrawFocusRect(context, &bounds);
+            }
         }
     }
     BitBlt(target, 0, 0, client.right, client.bottom, context, 0, 0, SRCCOPY);
@@ -1195,8 +1205,9 @@ static int tile_neighbor(const TILE_VIEW *view, WPARAM key)
 
 /*
  * History arrow-key target. The clips are stored newest first. Vertical layout: Up/Down walk the clips in time order
- * (Up = newer, Down = older), Left/Right jump to the neighbouring column. Horizontal layout: Left/Right walk the
- * clips in time order (Left = newer, Right = older), Up/Down jump to the neighbouring row. Nothing wraps around.
+ * (Up = newer, Down = older) but text clips and image clips are separate sequences (text stays among text, image
+ * among images); Left/Right jump to the neighbouring column. Horizontal layout: Left/Right walk all clips in time
+ * order (Left = newer, Right = older), Up/Down jump to the neighbouring row. Nothing wraps around.
  */
 static int tile_history_neighbor(const TILE_VIEW *view, WPARAM key)
 {
@@ -1207,7 +1218,11 @@ static int tile_history_neighbor(const TILE_VIEW *view, WPARAM key)
     int from_band, target_band = 0, best = -1, best_cost = INT_MAX, index;
     BOOL found = FALSE;
     if (by_time) {
-        int next = view->selected + (forward ? 1 : -1);
+        int next = view->selected;
+        BOOL image = view->entries[view->selected].image != NULL;
+        do {
+            next += forward ? 1 : -1;
+        } while (view->vertical && next >= 0 && next < view->count && (view->entries[next].image != NULL) != image);
         return next >= 0 && next < view->count ? next : -1;
     }
     if (view->bands == NULL) return -1;
