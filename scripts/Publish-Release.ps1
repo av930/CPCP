@@ -110,7 +110,9 @@ try {
 		throw "Tag $tag already exists. Supply a new -Version, for example $Version-2."
 	}
 	if (Test-Path -LiteralPath $archivePath) {
-		throw "The release archive already exists: $archivePath"
+		# The tag does not exist (checked above), so this ZIP is left over from an unpublished run: rebuild it.
+		Write-Step "Removing the unpublished archive from an earlier run: $archivePath"
+		Remove-Item -LiteralPath $archivePath -Force
 	}
 
 	if (-not $PSCmdlet.ShouldProcess("$repository $tag", 'Build, test, package, and publish')) {
