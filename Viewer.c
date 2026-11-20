@@ -2909,6 +2909,10 @@ static LRESULT CALLBACK viewer_search_proc(HWND window, UINT message, WPARAM par
 {
 	UNREFERENCED_PARAMETER(subclass_id);
 	UNREFERENCED_PARAMETER(reference);
+	if (message == WM_KEYDOWN && parameter == VK_DOWN) {
+		tileview_focus(GetDlgItem(GetParent(window), ID_CLIPMASTER_TILES));
+		return 0;
+	}
 	if (message == WM_KEYDOWN && parameter == VK_RETURN) {
 		SendMessage(GetParent(window), WM_TILE_SEARCH, 0, 0);
 		return 0;
@@ -3762,6 +3766,23 @@ static LRESULT CALLBACK viewer_proc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
 				replacement = clipedit_show(hInst, hWnd, original, (int)wParam);
 				if (replacement != NULL) viewer_commit_favorite(hWnd, original, replacement);
 			}
+		}
+		break;
+
+	case WM_TILE_COPY:
+		/* Enter on a history clip: put it on the clipboard (without adding a new history entry) and move it to the front. */
+		{
+			DATA_INFO **link = &history_data.child;
+			DATA_INFO *item;
+			while (*link != NULL && *link != (DATA_INFO *)lParam) link = &(*link)->next;
+			if (*link == NULL || !SendMessage(main_wnd, WM_ITEM_TO_CLIPBOARD_EXACT, 0, lParam)) break;
+			item = *link;
+			*link = item->next;
+			data_set_modified(item);
+			item->next = history_data.child;
+			history_data.child = item;
+			if (option.history_save == 1 && option.history_always_save == 1) SendMessage(hWnd, WM_HISTORY_SAVE, 0, 0);
+			SendMessage(hWnd, WM_HISTORY_CHANGED, 0, 0);
 		}
 		break;
 
