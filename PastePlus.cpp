@@ -62,6 +62,15 @@ struct PastePane {
     int height = 0;
     bool layout = false;
     bool ocr_running = false;
+    int handler_count = 3;                  /* visible rows of the paste handler editor */
+    HWND handler_title = nullptr;
+    HWND handler_header[3] = {};
+    HWND handler_label[16] = {};
+    HWND handler_edit[48] = {};             /* row * 3 + column: target, condition, action */
+    HWND handler_add = nullptr;
+    HWND handler_remove = nullptr;
+    HWND handler_save = nullptr;
+    HWND handler_status = nullptr;
 };
 
 struct OcrCompletion {
@@ -478,6 +487,99 @@ static HWND pane_control(HWND owner, const wchar_t *type, const wchar_t *text, D
     return control;
 }
 
+#define BUTTON_STYLE_PROP L"ClipMaster.ButtonStyle"
+#define BUTTON_HOVER_PROP L"ClipMaster.ButtonHover"
+
+static COLORREF color_mix(COLORREF base, COLORREF other, int percent)
+{
+    return RGB((GetRValue(base) * (100 - percent) + GetRValue(other) * percent) / 100,
+        (GetGValue(base) * (100 - percent) + GetGValue(other) * percent) / 100,
+        (GetBValue(base) * (100 - percent) + GetBValue(other) * percent) / 100);
+}
+
+/* Tracks the mouse so the button can draw a hover color. */
+static LRESULT CALLBACK button_hover_proc(HWND window, UINT message, WPARAM parameter, LPARAM data,
+    UINT_PTR identifier, DWORD_PTR reference)
+{
+    UNREFERENCED_PARAMETER(reference);
+    switch (message) {
+    case WM_MOUSEMOVE:
+        if (!GetProp(window, BUTTON_HOVER_PROP)) {
+            TRACKMOUSEEVENT track = { sizeof(track), TME_LEAVE, window, 0 };
+            TrackMouseEvent(&track);
+            SetProp(window, BUTTON_HOVER_PROP, reinterpret_cast<HANDLE>(1));
+            InvalidateRect(window, nullptr, FALSE);
+        }
+        break;
+    case WM_MOUSELEAVE:
+        RemoveProp(window, BUTTON_HOVER_PROP);
+        InvalidateRect(window, nullptr, FALSE);
+        break;
+    case WM_NCDESTROY:
+        RemoveProp(window, BUTTON_HOVER_PROP);
+        RemoveProp(window, BUTTON_STYLE_PROP);
+        RemoveWindowSubclass(window, button_hover_proc, identifier);
+        break;
+    }
+    return DefSubclassProc(window, message, parameter, data);
+}
+
+extern "C" void pasteplus_button_style(HWND button, int kind)
+{
+    SetProp(button, BUTTON_STYLE_PROP, reinterpret_cast<HANDLE>(static_cast<INT_PTR>(kind + 1)));
+    SetWindowSubclass(button, button_hover_proc, 1, 0);
+}
+
+extern "C" BOOL pasteplus_button_draw(const DRAWITEMSTRUCT *draw)
+{
+    if (!draw || draw->CtlType != ODT_BUTTON) return FALSE;
+    INT_PTR kind = reinterpret_cast<INT_PTR>(GetProp(draw->hwndItem, BUTTON_STYLE_PROP)) - 1;
+    if (kind < 0) return FALSE;
+    bool pressed = (draw->itemState & ODS_SELECTED) != 0;
+    bool disabled = (draw->itemState & ODS_DISABLED) != 0;
+    bool hover = GetProp(draw->hwndItem, BUTTON_HOVER_PROP) != nullptr;
+    COLORREF surface = dark_mode_get_color(COLOR_BTNFACE), ink = dark_mode_get_color(COLOR_WINDOWTEXT);
+    COLORREF fill, border, text;
+    if (kind == PASTEPLUS_BUTTON_PRIMARY) { fill = RGB(36, 112, 196); border = RGB(22, 79, 151); text = RGB(255, 255, 255); }
+    else if (kind == PASTEPLUS_BUTTON_DANGER) { fill = RGB(200, 62, 62); border = RGB(150, 40, 40); text = RGB(255, 255, 255); }
+    else { fill = dark_mode_get_color(COLOR_WINDOW); border = color_mix(ink, surface, 60); text = ink; }
+    bool colored = kind != PASTEPLUS_BUTTON_NORMAL;
+    if (disabled) {
+        fill = color_mix(fill, surface, 70);
+        border = color_mix(border, surface, 70);
+        text = color_mix(text, surface, 60);
+    } else if (pressed) {
+        fill = colored ? color_mix(fill, RGB(0, 0, 0), 20) : color_mix(fill, ink, 16);
+    } else if (hover) {
+        fill = colored ? color_mix(fill, RGB(255, 255, 255), 14) : color_mix(fill, ink, 7);
+        if (!colored) border = color_mix(ink, surface, 30);
+    }
+    HFONT font = reinterpret_cast<HFONT>(SendMessage(draw->hwndItem, WM_GETFONT, 0, 0));
+    HBRUSH fill_brush = CreateSolidBrush(fill);
+    HBRUSH border_brush = CreateSolidBrush(border);
+    RECT area = draw->rcItem;
+    wchar_t caption[128];
+    GetWindowText(draw->hwndItem, caption, ARRAYSIZE(caption));
+    int saved = SaveDC(draw->hDC);
+    FillRect(draw->hDC, &area, fill_brush);
+    FrameRect(draw->hDC, &area, border_brush);
+    SetBkMode(draw->hDC, TRANSPARENT);
+    SetTextColor(draw->hDC, text);
+    SelectObject(draw->hDC, font ? font : GetStockObject(DEFAULT_GUI_FONT));
+    if (pressed && !disabled) OffsetRect(&area, 0, 1);
+    DrawText(draw->hDC, caption, -1, &area, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+    if ((draw->itemState & ODS_FOCUS) && !disabled) {
+        RECT focus = draw->rcItem;
+        InflateRect(&focus, -pane_scale(draw->hwndItem, 3), -pane_scale(draw->hwndItem, 3));
+        SetTextColor(draw->hDC, text);
+        DrawFocusRect(draw->hDC, &focus);
+    }
+    RestoreDC(draw->hDC, saved);
+    DeleteObject(fill_brush);
+    DeleteObject(border_brush);
+    return TRUE;
+}
+
 static const wchar_t *symbol_names[] = {
     L"Common Symbols", L"Arrows", L"Mathematics", L"Currency", L"Greek", L"Box Drawing"
 };
@@ -760,7 +862,38 @@ static void pane_layout(HWND window, PastePane *pane)
         pane_place(GetDlgItem(tile, 1), pane_scale(window, 8), pane_scale(window, 8), width - pane_scale(window, 16), pane_scale(window, 28));
         pane_place(GetDlgItem(tile, 2), pane_scale(window, 8), pane_scale(window, 44), width - pane_scale(window, 16), size - pane_scale(window, 56));
     }
-    pane->height = tiles_top + static_cast<int>((pane->tiles.size() + columns - 1) / columns) * (size + gap) + margin;
+    int rows = static_cast<int>((pane->tiles.size() + columns - 1) / columns);
+    int handlers_top = tiles_top + rows * (size + gap);
+    int title_height = pane_scale(window, 24), row_height = pane_scale(window, 32);
+    int field_gap = pane_scale(window, 8), label_width = pane_scale(window, 44);
+    int part = max(1, (available - label_width) / 4);
+    int heading_top = handlers_top - pane->offset;
+    int rows_top = heading_top + title_height + pane_scale(window, 34);
+    int buttons_top = rows_top + pane->handler_count * row_height + field_gap;
+    int button_gap = pane_scale(window, 8), handler_button = pane_scale(window, 120);
+    pane_place(pane->handler_title, margin, heading_top, available, title_height);
+    for (int column = 0; column < 3; column++) {
+        int left = margin + label_width + column * (part + field_gap);
+        int field_width = column == 2 ? max(1, margin + available - left) : part;
+        pane_place(pane->handler_header[column], left, heading_top + title_height + pane_scale(window, 6), field_width, pane_scale(window, 24));
+        for (int row = 0; row < 16; row++) {
+            HWND edit = pane->handler_edit[row * 3 + column];
+            pane_place(edit, left, rows_top + row * row_height, field_width, pane_scale(window, 26));
+            ShowWindow(edit, row < pane->handler_count ? SW_SHOW : SW_HIDE);
+        }
+    }
+    for (int row = 0; row < 16; row++) {
+        pane_place(pane->handler_label[row], margin, rows_top + row * row_height + pane_scale(window, 3), label_width, pane_scale(window, 24));
+        ShowWindow(pane->handler_label[row], row < pane->handler_count ? SW_SHOW : SW_HIDE);
+    }
+    pane_place(pane->handler_add, margin, buttons_top, handler_button, button_height);
+    pane_place(pane->handler_remove, margin + handler_button + button_gap, buttons_top, handler_button, button_height);
+    pane_place(pane->handler_save, margin + (handler_button + button_gap) * 2, buttons_top, handler_button, button_height);
+    pane_place(pane->handler_status, margin + (handler_button + button_gap) * 3, buttons_top,
+        max(1, available - (handler_button + button_gap) * 3), button_height);
+    EnableWindow(pane->handler_add, pane->handler_count < 16);
+    EnableWindow(pane->handler_remove, pane->handler_count > 3);
+    pane->height = buttons_top + pane->offset + button_height + margin;
     SCROLLINFO scroll = { sizeof(scroll), SIF_RANGE | SIF_PAGE | SIF_POS | SIF_DISABLENOSCROLL };
     scroll.nMax = max(0, pane->height - 1);
     scroll.nPage = client.bottom;
@@ -770,6 +903,45 @@ static void pane_layout(HWND window, PastePane *pane)
     pane->layout = false;
     RedrawWindow(window, nullptr, nullptr, RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN | RDW_UPDATENOW);
     if (adjusted != pane->offset) { pane->offset = adjusted; pane_layout(window, pane); }
+}
+
+/* Scrolls the pane so that the control is fully visible. */
+static void pane_reveal(HWND window, PastePane *pane, HWND control)
+{
+    RECT rect, client;
+    GetWindowRect(control, &rect);
+    MapWindowPoints(nullptr, window, reinterpret_cast<POINT *>(&rect), 2);
+    GetClientRect(window, &client);
+    int margin = pane_scale(window, 12), delta = 0;
+    if (rect.top < 0) delta = rect.top - margin;
+    else if (rect.bottom > client.bottom) delta = rect.bottom - client.bottom + margin;
+    if (!delta) return;
+    SCROLLINFO scroll = { sizeof(scroll), SIF_POS };
+    scroll.nPos = pane->offset + delta;
+    SetScrollInfo(window, SB_VERT, &scroll, TRUE);
+    pane->offset = GetScrollPos(window, SB_VERT);
+    pane_layout(window, pane);
+}
+
+static void pane_save_handlers(HWND window, PastePane *pane)
+{
+    OPTION_INFO candidate = option;
+    candidate.config_handler_count = pane->handler_count;
+    for (int row = 0; row < 16; row++) {
+        auto &handler = candidate.config_handlers[row];
+        if (row >= pane->handler_count) { ZeroMemory(&handler, sizeof(handler)); continue; }
+        GetWindowText(pane->handler_edit[row * 3], handler.formats, ARRAYSIZE(handler.formats));
+        GetWindowText(pane->handler_edit[row * 3 + 1], handler.pattern, ARRAYSIZE(handler.pattern));
+        GetWindowText(pane->handler_edit[row * 3 + 2], handler.script, ARRAYSIZE(handler.script));
+        if ((!*handler.formats) != (!*handler.script)) {
+            SetWindowText(pane->handler_status, L"\uAC01 handler\uC5D0\uB294 \uB300\uC0C1 \uC11C\uC2DD\uACFC PowerShell \uCC98\uB9AC\uAC00 \uBAA8\uB450 \uD544\uC694\uD569\uB2C8\uB2E4.");
+            SetFocus(pane->handler_edit[row * 3 + (*handler.formats ? 2 : 0)]);
+            return;
+        }
+    }
+    bool saved = SendMessage(GetParent(window), WM_PASTEPLUS_APPLY_HANDLERS, 0, reinterpret_cast<LPARAM>(&candidate)) != FALSE;
+    SetWindowText(pane->handler_status, saved ? L"Handler\uB97C \uC800\uC7A5\uD588\uC2B5\uB2C8\uB2E4." :
+        L"Handler\uB97C \uC800\uC7A5\uD558\uC9C0 \uBABB\uD588\uC2B5\uB2C8\uB2E4. \uB2E8\uCD95\uD0A4 \uCDA9\uB3CC\uACFC \uC800\uC7A5 \uAD8C\uD55C\uC744 \uD655\uC778\uD574 \uC8FC\uC138\uC694.");
 }
 
 static void pane_text_paste(HWND window, const std::wstring &text)
@@ -879,38 +1051,40 @@ static LRESULT CALLBACK pane_proc(HWND window, UINT message, WPARAM parameter, L
         pane->status = pane_control(window, L"STATIC", L"", SS_LEFT, 101);
         pane->extract_text = pane_control(window, L"BUTTON", L"Extract text", BS_OWNERDRAW | WS_TABSTOP, 102);
         pane->extracted = pane_control(window, L"EDIT", L"", ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | WS_VSCROLL | WS_TABSTOP, 103);
+        pasteplus_button_style(pane->extract_text, PASTEPLUS_BUTTON_PRIMARY);
+        pane->handler_count = min(16, max(3, option.config_handler_count));
+        pane->handler_title = pane_control(window, L"STATIC", L"Paste handler", SS_LEFT, 2000);
+        static const wchar_t *handler_titles[] = { L"\uB300\uC0C1", L"\uC870\uAC74", L"\uCC98\uB9AC (PowerShell)" };
+        for (int column = 0; column < 3; column++)
+            pane->handler_header[column] = pane_control(window, L"STATIC", handler_titles[column], SS_LEFT, 2001 + column);
+        for (int row = 0; row < 16; row++) {
+            wchar_t label[8];
+            wsprintf(label, L"PH%d", row + 1);
+            pane->handler_label[row] = pane_control(window, L"STATIC", label, SS_LEFT, 2010 + row);
+            for (int column = 0; column < 3; column++) {
+                const wchar_t *text = column == 0 ? option.config_handlers[row].formats :
+                    column == 1 ? option.config_handlers[row].pattern : option.config_handlers[row].script;
+                HWND edit = pane_control(window, L"EDIT", text, ES_AUTOHSCROLL | WS_TABSTOP, 2100 + row * 3 + column);
+                SendMessage(edit, EM_SETLIMITTEXT, column == 0 ? 127 : column == 1 ? 255 : 2047, 0);
+                pane->handler_edit[row * 3 + column] = edit;
+            }
+        }
+        pane->handler_add = pane_control(window, L"BUTTON", L"Handler \uCD94\uAC00", BS_OWNERDRAW | WS_TABSTOP, 2200);
+        pane->handler_remove = pane_control(window, L"BUTTON", L"\uB9C8\uC9C0\uB9C9 \uD589 \uC0AD\uC81C", BS_OWNERDRAW | WS_TABSTOP, 2201);
+        pane->handler_save = pane_control(window, L"BUTTON", L"Handler \uC800\uC7A5", BS_OWNERDRAW | WS_TABSTOP, 2202);
+        pane->handler_status = pane_control(window, L"STATIC", L"", SS_LEFT | SS_CENTERIMAGE, 2203);
+        pasteplus_button_style(pane->handler_add, PASTEPLUS_BUTTON_NORMAL);
+        pasteplus_button_style(pane->handler_remove, PASTEPLUS_BUTTON_NORMAL);
+        pasteplus_button_style(pane->handler_save, PASTEPLUS_BUTTON_PRIMARY);
         return 0;
     }
     if (!pane) return DefWindowProc(window, message, parameter, data);
     switch (message) {
     case WM_SIZE:
     case WM_DPICHANGED_AFTERPARENT: pane_layout(window, pane); return 0;
-        case WM_DRAWITEM: {
-            DRAWITEMSTRUCT *draw = reinterpret_cast<DRAWITEMSTRUCT *>(data);
-            if (draw && draw->CtlID == 102) {
-                COLORREF background = (draw->itemState & ODS_SELECTED) ? RGB(22, 79, 151) : RGB(36, 112, 196);
-                HBRUSH fill = CreateSolidBrush(background);
-                HBRUSH border = CreateSolidBrush(RGB(22, 79, 151));
-                RECT text = draw->rcItem;
-                int saved = SaveDC(draw->hDC);
-                FillRect(draw->hDC, &draw->rcItem, fill);
-                FrameRect(draw->hDC, &draw->rcItem, border);
-                SetBkMode(draw->hDC, TRANSPARENT);
-                SetTextColor(draw->hDC, RGB(255, 255, 255));
-                SelectObject(draw->hDC, GetStockObject(DEFAULT_GUI_FONT));
-                DrawText(draw->hDC, L"Extract text", -1, &text,
-                    DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
-                if (draw->itemState & ODS_FOCUS) {
-                    InflateRect(&text, -pane_scale(window, 3), -pane_scale(window, 3));
-                    DrawFocusRect(draw->hDC, &text);
-                }
-                RestoreDC(draw->hDC, saved);
-                DeleteObject(fill);
-                DeleteObject(border);
-                return TRUE;
-            }
+        case WM_DRAWITEM:
+            if (pasteplus_button_draw(reinterpret_cast<DRAWITEMSTRUCT *>(data))) return TRUE;
             break;
-        }
     case WM_MOUSEWHEEL:
     case WM_VSCROLL: {
         SCROLLINFO scroll = { sizeof(scroll), SIF_ALL };
@@ -933,7 +1107,16 @@ static LRESULT CALLBACK pane_proc(HWND window, UINT message, WPARAM parameter, L
     }
     case WM_COMMAND: {
         int identifier = LOWORD(parameter);
-        if (identifier == 102) {
+        if (identifier >= 2100 && identifier < 2100 + 48) {
+            if (HIWORD(parameter) == EN_SETFOCUS) pane_reveal(window, pane, reinterpret_cast<HWND>(data));
+        } else if (identifier == 2200 || identifier == 2201) {
+            pane->handler_count = min(16, max(3, pane->handler_count + (identifier == 2200 ? 1 : -1)));
+            SetWindowText(pane->handler_status, L"");
+            pane_layout(window, pane);
+            pane_reveal(window, pane, pane->handler_save);
+        } else if (identifier == 2202) {
+            pane_save_handlers(window, pane);
+        } else if (identifier == 102) {
             if (!pane->ocr_running) pane_extract_text(window, pane);
         } else if (identifier >= 1000 && identifier < 1000 + static_cast<int>(pane->tiles.size())) {
             FormatTile &tile = pane->tiles[identifier - 1000];

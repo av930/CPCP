@@ -114,8 +114,6 @@ static HWND paste_target;
 static HWND paste_focus;
 static int settings_height = 1600;
 static DATA_INFO *sample_data;
-static int settings_handler_top;
-static int settings_handler_count;
 HMENU h_popup_menu;
 
 HTREEITEM clip_treeitem;
@@ -2528,7 +2526,7 @@ static void viewer_settings_layout(HWND panel)
 	int index, column;
 	int dpi = (int)GetDpiForWindow(panel);
 	int offset = GetScrollPos(panel, SB_VERT);
-	int width, content, left, column_width, top, table_width, part, footer, buttons, columns;
+	int width, content, left, column_width, top, footer, buttons, button_width, columns;
 	int cursor[3];
 	const int actions[] = { ID_CLIPMASTER_SAVE, 5482, 5483, 5484, 5485 };
 	GetClientRect(panel, &client);
@@ -2543,33 +2541,12 @@ static void viewer_settings_layout(HWND panel)
 		cursor[column] += blocks[index](panel, dpi, offset, left + column * (column_width + 16), cursor[column], column_width) + 12;
 	}
 	top = max(cursor[0], max(cursor[1], cursor[2]));
-	settings_handler_top = top + 52;
-	settings_place(panel, dpi, offset, 6006, left, top, content, 96 + settings_handler_count * 32);
-	table_width = max(1, content - 76);
-	part = table_width / 4;
-	for (column = 0; column < 3; column++) {
-		int x = left + 48 + column * (part + 8);
-		int field_width = column == 2 ? table_width - part * 2 : part;
-		settings_place(panel, dpi, offset, 5590 + column, x, top + 26, field_width, 24);
-		for (index = 0; index < 16; index++) {
-			settings_place(panel, dpi, offset, 5500 + index * 3 + column, x, top + 52 + index * 32, field_width, 26);
-			ShowWindow(GetDlgItem(panel, 5500 + index * 3 + column), index < settings_handler_count ? SW_SHOW : SW_HIDE);
-		}
-	}
-	for (index = 0; index < 16; index++) {
-		settings_place(panel, dpi, offset, 5700 + index, left + 12, top + 55 + index * 32, 32, 24);
-		ShowWindow(GetDlgItem(panel, 5700 + index), index < settings_handler_count ? SW_SHOW : SW_HIDE);
-	}
-	settings_place(panel, dpi, offset, 5480, left + 12, top + 56 + settings_handler_count * 32, 112, 28);
-	settings_place(panel, dpi, offset, 5481, left + 132, top + 56 + settings_handler_count * 32, 112, 28);
-	EnableWindow(GetDlgItem(panel, 5480), settings_handler_count < 16);
-	EnableWindow(GetDlgItem(panel, 5481), settings_handler_count > 3);
-	footer = top + 108 + settings_handler_count * 32;
-	buttons = min(5, max(1, content / 132));
+	footer = top;
+	buttons = min(5, max(1, content / 156));
+	button_width = min(200, (content - (buttons - 1) * 8) / buttons);
 	for (index = 0; index < 5; index++) settings_place(panel, dpi, offset, actions[index],
-		left + (index % buttons) * ((content + 8) / buttons), footer + (index / buttons) * 40,
-		(content - (buttons - 1) * 8) / buttons, 32);
-	footer += ((5 + buttons - 1) / buttons) * 40;
+		left + (index % buttons) * (button_width + 8), footer + (index / buttons) * 44, button_width, 36);
+	footer += ((5 + buttons - 1) / buttons) * 44;
 	settings_place(panel, dpi, offset, ID_CLIPMASTER_STATUS, left, footer + 8, content, 64);
 	settings_height = footer + 88;
 	EnableWindow(GetDlgItem(panel, 5104), IsDlgButtonChecked(panel, 5103) == BST_CHECKED);
@@ -2609,6 +2586,22 @@ BOOL viewer_settings_message(HWND hWnd, MSG *message)
 {
 	HWND panel = GetDlgItem(hWnd, ID_CLIPMASTER_PANEL);
 	HWND search = GetDlgItem(hWnd, ID_CLIPMASTER_SEARCH);
+	/* Ctrl+PageUp / Ctrl+PageDown: move to the previous / next tab, wrapping around. */
+	if (message->message == WM_KEYDOWN && (message->wParam == VK_PRIOR || message->wParam == VK_NEXT) &&
+		(GetKeyState(VK_CONTROL) & 0x8000) && !(GetKeyState(VK_MENU) & 0x8000) &&
+		(message->hwnd == hWnd || IsChild(hWnd, message->hwnd))) {
+		int count = TabCtrl_GetItemCount(GetDlgItem(hWnd, ID_CLIPMASTER_TABS));
+		int current = TabCtrl_GetCurSel(GetDlgItem(hWnd, ID_CLIPMASTER_TABS));
+		if (count > 0 && current >= 0) {
+			viewer_select_tab(hWnd, (current + (message->wParam == VK_NEXT ? 1 : count - 1)) % count);
+		}
+		return TRUE;
+	}
+	/* Tab / Shift+Tab walks the paste handler fields of the PastePlus tab. */
+	if (message->message == WM_KEYDOWN && message->wParam == VK_TAB && !(GetKeyState(VK_CONTROL) & 0x8000)) {
+		HWND pasteplus = GetDlgItem(hWnd, ID_CLIPMASTER_PASTEPLUS);
+		if (IsWindowVisible(pasteplus) && IsChild(pasteplus, message->hwnd)) return IsDialogMessage(pasteplus, message);
+	}
 	/* Typing while a history clip has the focus: move the focus to the search box and let it receive the key. */
 	if (message->message == WM_KEYDOWN && message->hwnd == GetDlgItem(hWnd, ID_CLIPMASTER_TILES) &&
 		IsWindowVisible(search) && viewer_is_text_key(message)) {
@@ -2645,6 +2638,9 @@ static LRESULT CALLBACK viewer_settings_proc(HWND panel, UINT msg, WPARAM wParam
 		GetClientRect(panel, &client);
 		FillRect((HDC)wParam, &client, dark_mode_get_brush(COLOR_BTNFACE));
 		return 1;
+	}
+	if (msg == WM_DRAWITEM && pasteplus_button_draw((const DRAWITEMSTRUCT *)lParam)) {
+		return TRUE;
 	}
 	if (msg == WM_COMMAND) {
 		if (LOWORD(wParam) == 5103 || LOWORD(wParam) == 5105) viewer_settings_layout(panel);
@@ -2723,8 +2719,7 @@ static void viewer_create_settings(const HWND hWnd)
 	int value;
 	const CLIPMASTER_SETTING *setting;
 	const TCHAR *groups[] = { TEXT("기본 설정"), TEXT("히스토리 보존 정책"), TEXT("단축키"),
-		TEXT("저장 제외 clip category"), TEXT("붙여넣기 handler (서식명, 콤마로 구분)"), TEXT("프로그램 기능"), TEXT("Paste handler") };
-	settings_handler_count = option.config_handler_count;
+		TEXT("저장 제외 clip category"), TEXT("붙여넣기 handler (서식명, 콤마로 구분)"), TEXT("프로그램 기능") };
 	SetWindowSubclass(panel, viewer_settings_proc, 1, 0);
 	viewer_settings_font(panel);
 	for (index = 0; index < ARRAYSIZE(groups); index++) {
@@ -2733,30 +2728,6 @@ static void viewer_create_settings(const HWND hWnd)
 	}
 	for (index = 0; index < ARRAYSIZE(clipmaster_settings); index++) {
 		int field = index < 9 ? index : index + 1;
-		if (field == 17) {
-			int row, column;
-			top += 76;
-			settings_handler_top = top;
-			viewer_setting_control(panel, TEXT("STATIC"), TEXT("대상"), 0, 5590, 16, top - 26, 96, 24);
-			viewer_setting_control(panel, TEXT("STATIC"), TEXT("조건"), 0, 5591, 116, top - 26, 96, 24);
-			viewer_setting_control(panel, TEXT("STATIC"), TEXT("처리 (PowerShell)"), 0, 5592, 216, top - 26, 96, 24);
-			for (row = 0; row < 16; row++) {
-				TCHAR label[16];
-				wsprintf(label, TEXT("PH%d"), row + 1);
-				viewer_setting_control(panel, TEXT("STATIC"), label, 0, 5700 + row, 16, top + row * 34, 28, 24);
-				for (column = 0; column < 3; column++) {
-					const TCHAR *text = column == 0 ? option.config_handlers[row].formats :
-						column == 1 ? option.config_handlers[row].pattern : option.config_handlers[row].script;
-					HWND edit = viewer_setting_control(panel, TEXT("EDIT"), text, ES_AUTOHSCROLL | WS_TABSTOP,
-						5500 + row * 3 + column, 48, top + row * 34, 96, 26);
-					SendMessage(edit, EM_SETLIMITTEXT, column == 0 ? 127 : column == 1 ? 255 : 2047, 0);
-				}
-			}
-			viewer_setting_control(panel, TEXT("BUTTON"), TEXT("Handler 추가"), BS_PUSHBUTTON | WS_TABSTOP, 5480, 16, top, 136, 28);
-			viewer_setting_control(panel, TEXT("BUTTON"), TEXT("마지막 행 삭제"), BS_PUSHBUTTON | WS_TABSTOP, 5481, 160, top, 136, 28);
-			top += settings_handler_count * 34 + 64;
-			top += 36;
-		}
 		setting = &clipmaster_settings[index];
 		value = *(int *)((BYTE *)&option + setting->offset);
 		if (setting->maximum == 0) {
@@ -2819,12 +2790,18 @@ static void viewer_create_settings(const HWND hWnd)
 	viewer_setting_control(panel, TEXT("EDIT"), TEXT(""), ES_NUMBER | ES_RIGHT | WS_TABSTOP, 5430, 0, 0, 1, 1);
 	SetDlgItemInt(panel, 5430, option.config_paste_interval, FALSE);
 	viewer_setting_control(panel, TEXT("STATIC"), TEXT("ms"), 0, 6431, 0, 0, 1, 1);
-	viewer_setting_control(panel, TEXT("BUTTON"), TEXT("설정 저장"), BS_PUSHBUTTON | WS_TABSTOP,
-		ID_CLIPMASTER_SAVE, 16, top + 20, 132, 32);
-	viewer_setting_control(panel, TEXT("BUTTON"), TEXT("저장 후 재시작"), BS_PUSHBUTTON | WS_TABSTOP, 5483, 160, top + 20, 136, 32);
-	viewer_setting_control(panel, TEXT("BUTTON"), TEXT("설정 초기화"), BS_PUSHBUTTON | WS_TABSTOP, 5482, 16, top + 64, 280, 32);
-	viewer_setting_control(panel, TEXT("BUTTON"), TEXT("히스토리 초기화"), BS_PUSHBUTTON | WS_TABSTOP, 5484, 16, top + 108, 280, 32);
-	viewer_setting_control(panel, TEXT("BUTTON"), TEXT("프로그램 종료"), BS_PUSHBUTTON | WS_TABSTOP, 5485, 16, top + 152, 136, 32);
+	{
+		const struct { const TCHAR *text; int id; int kind; } actions[] = {
+			{ TEXT("설정 저장"), ID_CLIPMASTER_SAVE, PASTEPLUS_BUTTON_PRIMARY },
+			{ TEXT("저장 후 재시작"), 5483, PASTEPLUS_BUTTON_PRIMARY },
+			{ TEXT("설정 초기화"), 5482, PASTEPLUS_BUTTON_DANGER },
+			{ TEXT("히스토리 초기화"), 5484, PASTEPLUS_BUTTON_DANGER },
+			{ TEXT("프로그램 종료"), 5485, PASTEPLUS_BUTTON_NORMAL } };
+		for (index = 0; index < ARRAYSIZE(actions); index++) {
+			pasteplus_button_style(viewer_setting_control(panel, TEXT("BUTTON"), actions[index].text,
+				BS_OWNERDRAW | WS_TABSTOP, actions[index].id, 16, top + 20 + index * 44, 136, 36), actions[index].kind);
+		}
+	}
 	viewer_setting_control(panel, TEXT("STATIC"), TEXT(""), SS_LEFT,
 		ID_CLIPMASTER_STATUS, 16, top + 64, 288, 80);
 	viewer_settings_layout(panel);
@@ -2905,17 +2882,6 @@ static BOOL viewer_save_settings(const HWND hWnd)
 	GetDlgItemText(panel, 5440, candidate.config_handler_special, 256);
 	GetDlgItemText(panel, 5441, candidate.config_handler_unicode, 256);
 	GetDlgItemText(panel, 5442, candidate.config_handler_image, 256);
-	candidate.config_handler_count = settings_handler_count;
-	for (index = 0; index < 16; index++) {
-		if (index >= settings_handler_count) { ZeroMemory(&candidate.config_handlers[index], sizeof(candidate.config_handlers[index])); continue; }
-		GetDlgItemText(panel, 5500 + index * 3, candidate.config_handlers[index].formats, 128);
-		GetDlgItemText(panel, 5501 + index * 3, candidate.config_handlers[index].pattern, 256);
-		GetDlgItemText(panel, 5502 + index * 3, candidate.config_handlers[index].script, 2048);
-		if ((!*candidate.config_handlers[index].formats) != (!*candidate.config_handlers[index].script)) {
-			SetDlgItemText(panel, ID_CLIPMASTER_STATUS, TEXT("Each handler needs both a target format and a PowerShell action."));
-			return FALSE;
-		}
-	}
 	option = candidate;
 	if (!SendMessage(main_wnd, WM_CONFIG_APPLY, 0, (LPARAM)&previous)) {
 		option = previous;
@@ -2923,6 +2889,19 @@ static BOOL viewer_save_settings(const HWND hWnd)
 		return FALSE;
 	}
 	tileview_layout(GetDlgItem(hWnd, ID_CLIPMASTER_TILES), option.config_layout == 1);
+	return TRUE;
+}
+
+/* Applies handlers edited on the PastePlus tab; every other setting stays as it was saved. */
+static BOOL viewer_apply_handlers(const HWND hWnd, const OPTION_INFO *candidate)
+{
+	OPTION_INFO previous = option;
+	option = *candidate;
+	if (!SendMessage(main_wnd, WM_CONFIG_APPLY, 0, (LPARAM)&previous)) {
+		option = previous;
+		return FALSE;
+	}
+	pasteplus_refresh(GetDlgItem(hWnd, ID_CLIPMASTER_PASTEPLUS), history_data.child);
 	return TRUE;
 }
 
@@ -4097,13 +4076,11 @@ static LRESULT CALLBACK viewer_proc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
 		viewer_select_tab(hWnd, (int)wParam);
 		break;
 
+	case WM_PASTEPLUS_APPLY_HANDLERS:
+		return lParam != 0 && viewer_apply_handlers(hWnd, (const OPTION_INFO *)lParam);
+
 	case WM_COMMAND:
 		switch (LOWORD(wParam)) {
-		case 5480:
-		case 5481:
-			settings_handler_count = min(16, max(3, settings_handler_count + (LOWORD(wParam) == 5480 ? 1 : -1)));
-			SendMessage(GetDlgItem(hWnd, ID_CLIPMASTER_PANEL), WM_SIZE, 0, 0);
-			break;
 		case 5482:
 			PostMessage(main_wnd, WM_CONFIG_RESET, 0, 0);
 			break;
