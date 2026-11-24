@@ -14,6 +14,7 @@
 #undef  _INC_OLE
 #include <commctrl.h>
 #include <commdlg.h>
+#include <shlwapi.h>
 #include <tchar.h>
 
 #pragma comment(lib, "Version.lib")
@@ -53,6 +54,8 @@
 #include "ClipSample.h"
 #include "SendKey.h"
 #include "ClipEdit.h"
+#include "ClipHandler.h"
+#include "gdip.h"
 #include "PastePlus.h"
 #include "Hotkey.h"
 #include "Config.h"
@@ -2592,9 +2595,28 @@ static void viewer_settings_font(HWND panel)
 	if (previous != NULL) DeleteObject(previous);
 }
 
+/* A key that produces text (letters, digits, punctuation, Space, or any key swallowed by an IME) without Ctrl/Alt. */
+static BOOL viewer_is_text_key(const MSG *message)
+{
+	UINT key = (UINT)message->wParam;
+	if ((GetKeyState(VK_CONTROL) & 0x8000) || (GetKeyState(VK_MENU) & 0x8000)) return FALSE;
+	return (key >= '0' && key <= '9') || (key >= 'A' && key <= 'Z') || (key >= VK_NUMPAD0 && key <= VK_DIVIDE &&
+		key != VK_SEPARATOR) || (key >= VK_OEM_1 && key <= VK_OEM_3) || (key >= VK_OEM_4 && key <= VK_OEM_8) ||
+		key == VK_OEM_102 || key == VK_SPACE || key == VK_PROCESSKEY || key == VK_PACKET;
+}
+
 BOOL viewer_settings_message(HWND hWnd, MSG *message)
 {
 	HWND panel = GetDlgItem(hWnd, ID_CLIPMASTER_PANEL);
+	HWND search = GetDlgItem(hWnd, ID_CLIPMASTER_SEARCH);
+	/* Typing while a history clip has the focus: move the focus to the search box and let it receive the key. */
+	if (message->message == WM_KEYDOWN && message->hwnd == GetDlgItem(hWnd, ID_CLIPMASTER_TILES) &&
+		IsWindowVisible(search) && viewer_is_text_key(message)) {
+		int length = GetWindowTextLength(search);
+		SetFocus(search);
+		SendMessage(search, EM_SETSEL, length, length);
+		message->hwnd = search;
+	}
 	if (message->hwnd == GetDlgItem(hWnd, ID_CLIPMASTER_SEARCH) &&
 		message->message >= WM_KEYFIRST && message->message <= WM_KEYLAST) {
 		TranslateMessage(message);
@@ -2990,6 +3012,20 @@ static BOOL viewer_paste_clip(HWND window, DATA_INFO *item, BOOL exact)
 				sendkey_paste(target);
 				SendMessage(main_wnd, WM_REGIST_HOTKEY, 0, 0);
 			} else {
+				{
+					TCHAR diag[1024], tcls[128] = TEXT(""), ttitle[128] = TEXT(""), fcls[128] = TEXT(""), ftitle[128] = TEXT(""), dpath[MAX_PATH];
+					HWND fgw = GetForegroundWindow();
+					DWORD fgpid = 0, tpid = 0, written;
+					HANDLE df;
+					GetClassName(target, tcls, 128); GetWindowText(target, ttitle, 128);
+					GetClassName(fgw, fcls, 128); GetWindowText(fgw, ftitle, 128);
+					GetWindowThreadProcessId(fgw, &fgpid); GetWindowThreadProcessId(target, &tpid);
+					wsprintf(diag, TEXT("target=%p pid=%u cls=%s title=%s visible=%d iconic=%d | fg=%p pid=%u cls=%s title=%s | focus=%p\r\n"),
+						target, tpid, tcls, ttitle, IsWindowVisible(target), IsIconic(target), fgw, fgpid, fcls, ftitle, paste_focus);
+					GetTempPath(MAX_PATH, dpath); lstrcat(dpath, TEXT("cpcp_paste_diag.log"));
+					df = CreateFile(dpath, FILE_APPEND_DATA, FILE_SHARE_READ, NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+					if (df != INVALID_HANDLE_VALUE) { WriteFile(df, diag, lstrlen(diag) * sizeof(TCHAR), &written, NULL); CloseHandle(df); }
+				}
 				ShowWindow(window, SW_SHOW);
 				_SetForegroundWindow(window);
 				MessageBox(window, TEXT("Could not activate the target application. Clipboard contents were updated but not pasted."),
@@ -3027,14 +3063,180 @@ static BOOL viewer_commit_favorite(HWND window, DATA_INFO *original, DATA_INFO *
 	return TRUE;
 }
 
+/* Remove a history clip for good (e.g. it holds personal data) and rewrite the history file right away. */
+static void viewer_clip_remove(HWND window, DATA_INFO *item)
+{
+	if (option.viewer_delete_confirm == 1 && MessageBox(window, TEXT("Remove this clip from the clip manager?"),
+		WINDOW_TITLE, MB_YESNO | MB_ICONQUESTION) != IDYES) return;
+	/* Unlink first so the tile list and tree are rebuilt while nothing points at freed memory. */
+	if (!data_delete(&history_data.child, item, FALSE)) return;
+	SendMessage(window, WM_HISTORY_SAVE, 0, 0);
+	SendMessage(window, WM_HISTORY_CHANGED, 0, 0);
+	data_free(item);
+}
+
+static BOOL viewer_write_file(const TCHAR *path, const void *bytes, DWORD size)
+{
+	DWORD written = 0;
+	BOOL ok;
+	HANDLE file = CreateFile(path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+	if (file == INVALID_HANDLE_VALUE) return FALSE;
+	ok = WriteFile(file, bytes, size, &written, NULL) && written == size;
+	CloseHandle(file);
+	if (!ok) DeleteFile(path);
+	return ok;
+}
+
+static BOOL viewer_format_is_png(const DATA_INFO *format)
+{
+	return format->format_name != NULL && (!lstrcmpi(format->format_name, TEXT("PNG")) ||
+		!lstrcmpi(format->format_name, TEXT("image/png")));
+}
+
+static BOOL viewer_format_is_encoded_image(const DATA_INFO *format)
+{
+	return format->format == CF_TIFF || (format->format_name != NULL &&
+		(!lstrcmpi(format->format_name, TEXT("JFIF")) || !lstrcmpi(format->format_name, TEXT("JPEG")) ||
+		 !lstrcmpi(format->format_name, TEXT("GIF")) || !lstrcmpi(format->format_name, TEXT("TIFF")) ||
+		 StrStrI(format->format_name, TEXT("image/"))));
+}
+
+/* Ask for a file name; returns FALSE when cancelled. */
+static BOOL viewer_clip_file_name(HWND window, BOOL image, TCHAR *path)
+{
+	OPENFILENAME of;
+	SYSTEMTIME now;
+	GetLocalTime(&now);
+	wsprintf(path, TEXT("clip_%04d%02d%02d_%02d%02d%02d"), now.wYear, now.wMonth, now.wDay,
+		now.wHour, now.wMinute, now.wSecond);
+	ZeroMemory(&of, sizeof(of));
+	of.lStructSize = sizeof(of);
+	of.hwndOwner = window;
+	of.lpstrFilter = image ? TEXT("PNG image (*.png)\0*.png\0\0") : TEXT("Text file (*.txt)\0*.txt\0\0");
+	of.nFilterIndex = 1;
+	of.lpstrFile = path;
+	of.nMaxFile = MAX_PATH;
+	of.lpstrDefExt = image ? TEXT("png") : TEXT("txt");
+	of.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST | OFN_HIDEREADONLY | OFN_NOCHANGEDIR;
+	return GetSaveFileName(&of);
+}
+
+/* Save a text clip as a UTF-8 .txt file, or an image clip as a .png file. */
+static void viewer_clip_save_file(HWND window, DATA_INFO *item)
+{
+	DATA_INFO *format, *unicode = NULL, *ansi = NULL, *png = NULL, *dib = NULL, *dibv5 = NULL;
+	DATA_INFO *encoded = NULL, *bitmap = NULL;
+	TCHAR path[MAX_PATH];
+	BOOL ok = FALSE;
+	for (format = item->child; format != NULL; format = format->next) {
+		if (format->data == NULL) continue;
+		if (format->format == CF_UNICODETEXT && unicode == NULL) unicode = format;
+		else if (format->format == CF_TEXT && ansi == NULL) ansi = format;
+		else if (viewer_format_is_png(format) && png == NULL) png = format;
+		else if (format->format == CF_DIBV5 && dibv5 == NULL) dibv5 = format;
+		else if (format->format == CF_DIB && dib == NULL) dib = format;
+		else if (viewer_format_is_encoded_image(format) && encoded == NULL) encoded = format;
+		else if (format->format == CF_BITMAP && bitmap == NULL) bitmap = format;
+	}
+	if (unicode != NULL || ansi != NULL) {
+		DATA_INFO *source = unicode != NULL ? unicode : ansi;
+		SIZE_T available = min(GlobalSize(source->data), source->size);
+		const void *memory = GlobalLock(source->data);
+		WCHAR *wide = NULL;
+		char *utf8 = NULL;
+		int wide_length = 0, utf8_length = 0;
+		if (memory == NULL) {
+			MessageBox(window, TEXT("Could not read the clip data."), ERROR_TITLE, MB_OK | MB_ICONERROR);
+			return;
+		}
+		if (source == unicode) {
+			const WCHAR *text = (const WCHAR *)memory;
+			SIZE_T count = available / sizeof(WCHAR);
+			while ((SIZE_T)wide_length < count && text[wide_length]) wide_length++;
+			if (wide_length > 0) {
+				wide = mem_alloc(wide_length * sizeof(WCHAR));
+				if (wide != NULL) CopyMemory(wide, text, wide_length * sizeof(WCHAR));
+			}
+		} else {
+			const char *text = (const char *)memory;
+			int count = 0;
+			while ((SIZE_T)count < available && text[count]) count++;
+			wide_length = count > 0 ? MultiByteToWideChar(CP_ACP, 0, text, count, NULL, 0) : 0;
+			if (wide_length > 0) {
+				wide = mem_alloc(wide_length * sizeof(WCHAR));
+				if (wide != NULL) MultiByteToWideChar(CP_ACP, 0, text, count, wide, wide_length);
+			}
+		}
+		GlobalUnlock(source->data);
+		if (wide != NULL) utf8_length = WideCharToMultiByte(CP_UTF8, 0, wide, wide_length, NULL, 0, NULL, NULL);
+		if (utf8_length > 0) utf8 = mem_alloc(utf8_length);
+		if (utf8 != NULL) WideCharToMultiByte(CP_UTF8, 0, wide, wide_length, utf8, utf8_length, NULL, NULL);
+		mem_free(&wide);
+		if (utf8 == NULL) {
+			MessageBox(window, TEXT("This clip has no text to save."), WINDOW_TITLE, MB_OK | MB_ICONINFORMATION);
+			return;
+		}
+		if (viewer_clip_file_name(window, FALSE, path)) {
+			ok = viewer_write_file(path, utf8, utf8_length);
+			if (!ok) MessageBox(window, TEXT("Could not save the file."), ERROR_TITLE, MB_OK | MB_ICONERROR);
+		}
+		mem_free(&utf8);
+		return;
+	}
+	if (png != NULL || dibv5 != NULL || dib != NULL || encoded != NULL || bitmap != NULL) {
+		if (!viewer_clip_file_name(window, TRUE, path)) return;
+		if (png != NULL) {
+			const void *memory = GlobalLock(png->data);
+			if (memory != NULL) {
+				ok = viewer_write_file(path, memory, (DWORD)min(GlobalSize(png->data), png->size));
+				GlobalUnlock(png->data);
+			}
+		}
+		if (!ok && (dibv5 != NULL || dib != NULL)) {
+			DATA_INFO *source = dibv5 != NULL ? dibv5 : dib;
+			const BYTE *memory = GlobalLock(source->data);
+			if (memory != NULL) {
+				ok = save_png_dib(memory, (DWORD)min(GlobalSize(source->data), source->size), path);
+				GlobalUnlock(source->data);
+			}
+		}
+		if (!ok && encoded != NULL) {
+			const BYTE *memory = GlobalLock(encoded->data);
+			if (memory != NULL) {
+				ok = save_png_encoded(memory, (DWORD)min(GlobalSize(encoded->data), encoded->size), path);
+				GlobalUnlock(encoded->data);
+			}
+		}
+		if (!ok && bitmap != NULL) ok = save_png_hbitmap((HBITMAP)bitmap->data, path);
+		if (!ok) {
+			DeleteFile(path);
+			MessageBox(window, TEXT("Could not save the image."), ERROR_TITLE, MB_OK | MB_ICONERROR);
+		}
+		return;
+	}
+	MessageBox(window, TEXT("Only text and image clips can be saved as a file."), WINDOW_TITLE, MB_OK | MB_ICONINFORMATION);
+}
+
 static void viewer_select_tab(const HWND hWnd, int index)
 {
 	HTREEITEM root;
+	HWND page = NULL;
 	if (index < 0 || index > 5) {
 		return;
 	}
 	TabCtrl_SetCurSel(GetDlgItem(hWnd, ID_CLIPMASTER_TABS), index);
 	option.config_last_tab = index;
+	/* Only the clip pages are built with the window; Symbols and Setting build their many controls when first opened. */
+	if (index == 3 && GetDlgItem(hWnd, ID_CLIPMASTER_SYMBOLS) == NULL) {
+		page = pasteplus_symbols_create(hInst, hWnd, ID_CLIPMASTER_SYMBOLS);
+	} else if (index == 5 && GetDlgItem(hWnd, ID_CLIPMASTER_PANEL) == NULL) {
+		viewer_create_settings(hWnd);
+		page = GetDlgItem(hWnd, ID_CLIPMASTER_PANEL);
+	}
+	if (page != NULL) {
+		dark_mode_set_control(page);
+		dark_mode_set_children(page);
+	}
 	ShowWindow(GetDlgItem(hWnd, ID_TREE), SW_HIDE);
 	ShowWindow(GetDlgItem(hWnd, ID_CONTAINER), SW_HIDE);
 	ShowWindow(GetDlgItem(hWnd, ID_CLIPMASTER_PASTEPLUS), index == 2 ? SW_SHOW : SW_HIDE);
@@ -3156,7 +3358,6 @@ static BOOL viewer_initialize(const HWND hWnd)
 		TabCtrl_GetItemRect(tabs, 0, &item_rect);
 		TabCtrl_SetItemSize(tabs, item_rect.right - item_rect.left, item_rect.bottom - item_rect.top + Scale(2));
 	}
-	viewer_create_settings(hWnd);
 	tileview_create(hInst, hWnd, ID_CLIPMASTER_TILES);
 	tileview_layout(GetDlgItem(hWnd, ID_CLIPMASTER_TILES), option.config_layout == 1);
 	tileview_create(hInst, hWnd, ID_CLIPMASTER_FAVORITES);
@@ -3164,7 +3365,6 @@ static BOOL viewer_initialize(const HWND hWnd)
 	tileview_create(hInst, hWnd, ID_CLIPMASTER_SAMPLES);
 	tileview_samples(GetDlgItem(hWnd, ID_CLIPMASTER_SAMPLES), TRUE);
 	pasteplus_create(hInst, hWnd, ID_CLIPMASTER_PASTEPLUS);
-	pasteplus_symbols_create(hInst, hWnd, ID_CLIPMASTER_SYMBOLS);
 	viewer_setting_control(hWnd, TEXT("STATIC"), TEXT("clip search"), SS_LEFT | SS_CENTERIMAGE,
 		ID_CLIPMASTER_SEARCH_LABEL, 0, 0, 1, 1);
 	viewer_setting_control(hWnd, TEXT("EDIT"), TEXT(""), ES_AUTOHSCROLL | WS_TABSTOP,
@@ -3215,6 +3415,9 @@ static BOOL viewer_initialize(const HWND hWnd)
 	SendMessage(GetDlgItem(hWnd, ID_CONTAINER), WM_ALLHIDE, 0, 0);
 	// ステータスバー
 	statusbar_create(hWnd, ID_STATUSBAR);
+	// ダークモードの設定
+	// (before the tree gets its items: theming a filled tree view re-measures every item)
+	dark_mode_set_window(hWnd);
 
 	// クリップボードのアイテム取得
 	clip_di.type = TYPE_ITEM;
@@ -3483,8 +3686,6 @@ static LRESULT CALLBACK viewer_proc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
 	case WM_CREATE:
 		// ウィンドウ作成
 		viewer_initialize(hWnd);
-		// ダークモードの設定
-		dark_mode_set_window(hWnd);
 		viewer_set_controls(hWnd);
 
 		FocusWnd = GetDlgItem(hWnd, ID_TREE);
@@ -3797,22 +3998,28 @@ static LRESULT CALLBACK viewer_proc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
 				break;
 			}
 			if (msg == WM_TILE_FAVORITE) {
-				DATA_INFO *favorite;
-				int count = 0;
-				for (favorite = regist_data.child; favorite != NULL; favorite = favorite->next) {
-					if (favorite->type == TYPE_ITEM) count++;
-				}
-				if (count >= option.config_favorite_max) {
-					MessageBox(hWnd, TEXT("The favorites limit has been reached."), WINDOW_TITLE, MB_OK | MB_ICONINFORMATION);
-				} else if (regist_treeitem != NULL && MessageBox(hWnd, TEXT("Add this clip to favorites?"),
-					WINDOW_TITLE, MB_OKCANCEL | MB_ICONQUESTION) == IDOK) {
-					favorite = data_item_copy((DATA_INFO *)lParam, FALSE, FALSE, error);
-					if (favorite != NULL) {
-						mem_free(&favorite->window_name);
-						viewer_commit_favorite(hWnd, NULL, favorite);
-					} else if (*error) {
-						MessageBox(hWnd, error, ERROR_TITLE, MB_OK | MB_ICONERROR);
+				int choice = cliphandler_show(hInst, hWnd);
+				if (choice == CLIP_HANDLER_FAVORITE) {
+					DATA_INFO *favorite;
+					int count = 0;
+					for (favorite = regist_data.child; favorite != NULL; favorite = favorite->next) {
+						if (favorite->type == TYPE_ITEM) count++;
 					}
+					if (count >= option.config_favorite_max) {
+						MessageBox(hWnd, TEXT("The favorites limit has been reached."), WINDOW_TITLE, MB_OK | MB_ICONINFORMATION);
+					} else if (regist_treeitem != NULL) {
+						favorite = data_item_copy((DATA_INFO *)lParam, FALSE, FALSE, error);
+						if (favorite != NULL) {
+							mem_free(&favorite->window_name);
+							viewer_commit_favorite(hWnd, NULL, favorite);
+						} else if (*error) {
+							MessageBox(hWnd, error, ERROR_TITLE, MB_OK | MB_ICONERROR);
+						}
+					}
+				} else if (choice == CLIP_HANDLER_REMOVE) {
+					viewer_clip_remove(hWnd, (DATA_INFO *)lParam);
+				} else if (choice == CLIP_HANDLER_SAVE) {
+					viewer_clip_save_file(hWnd, (DATA_INFO *)lParam);
 				}
 			} else viewer_paste_clip(hWnd, (DATA_INFO *)lParam, FALSE);
 		}

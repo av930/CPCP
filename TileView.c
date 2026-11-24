@@ -15,6 +15,8 @@
 
 typedef struct {
     DATA_INFO *item;
+    ULONG_PTR formats;          /* tile_formats_key() and item->modified when the entry was made: reuse key */
+    FILETIME modified;
     TCHAR *text;
     HBITMAP image;
     int image_width;
@@ -23,6 +25,8 @@ typedef struct {
     RECT bounds;
     int kind;
     RECT divider;
+    int fit_width, fit_height, fit_dpi;     /* last tile_text_fits() question and its answer */
+    BOOL fits;
 } TILE_ENTRY;
 
 typedef struct {
@@ -59,6 +63,28 @@ typedef struct {
     BOOL samples;
     int *bands;                 /* per history tile: vertical layout = column index, horizontal layout = row (grows downwards) */
 } TILE_VIEW;
+
+/* Badge colors, one per category letter of tile_category(); all dark enough for white text. T and R (both text) are blues. */
+#define CATEGORY_COUNT 7
+static const TCHAR category_letters[CATEGORY_COUNT] = { TEXT('T'), TEXT('R'), TEXT('F'), TEXT('I'), TEXT('A'), TEXT('D'), TEXT('?') };
+static const COLORREF category_colors[CATEGORY_COUNT] = {
+    RGB(31, 92, 168),       /* T text: blue */
+    RGB(14, 136, 166),      /* R rich text: teal blue */
+    RGB(202, 104, 22),      /* F file: orange */
+    RGB(40, 150, 84),       /* I image: green */
+    RGB(110, 62, 152),      /* A audio: purple */
+    RGB(160, 38, 52),       /* D device: dark red */
+    RGB(64, 64, 64)         /* ? unknown: dark gray */
+};
+
+static int tile_category_index(TCHAR letter)
+{
+    int index;
+    for (index = 0; index < CATEGORY_COUNT; index++) {
+        if (category_letters[index] == letter) return index;
+    }
+    return CATEGORY_COUNT - 1;
+}
 
 static int tile_scale(HWND window, int value)
 {
@@ -261,14 +287,20 @@ static const TCHAR *const clip_panel_names[CLIP_PANEL_TYPE_COUNT] = {
     TEXT("TYPE4_W408_H96"), TEXT("TYPE5_W96_H200"), TEXT("TYPE6_W200_H200")
 };
 
-static void tile_clear(TILE_VIEW *view)
+static void tile_free_entries(TILE_ENTRY *entries, int count)
 {
     int index;
-    for (index = 0; index < view->count; index++) {
-        mem_free(&view->entries[index].text);
-        if (view->entries[index].image != NULL) DeleteObject(view->entries[index].image);
+    for (index = 0; index < count; index++) {
+        mem_free(&entries[index].text);
+        if (entries[index].image != NULL) DeleteObject(entries[index].image);
     }
-    mem_free(&view->entries);
+    mem_free(&entries);
+}
+
+static void tile_clear(TILE_VIEW *view)
+{
+    tile_free_entries(view->entries, view->count);
+    view->entries = NULL;
     mem_free(&view->lines);
     view->line_count = 0;
     mem_free(&view->paint_order);
@@ -276,6 +308,47 @@ static void tile_clear(TILE_VIEW *view)
     mem_free(&view->bands);
     view->separator_count = 0;
     view->count = 0;
+}
+
+/* Changes when a format of the clip is added, removed or replaced. */
+static ULONG_PTR tile_formats_key(const DATA_INFO *item)
+{
+    const DATA_INFO *format;
+    ULONG_PTR key = 0;
+    for (format = item->child; format != NULL; format = format->next) {
+        key = key * 31 + (ULONG_PTR)format + (ULONG_PTR)format->data + format->size;
+    }
+    return key;
+}
+
+/*
+ * Moves the preview and the text measurement of a clip out of the previous entries, so a refresh neither decodes every
+ * image nor measures every text again: the preview while the formats are unchanged, the measurement while the text is.
+ * The entries mostly keep their order, so the search starts after the previous match.
+ */
+static void tile_take_cached(TILE_ENTRY *previous, int previous_count, int *cursor, TILE_ENTRY *entry)
+{
+    int step, index;
+    for (step = 0; step < previous_count; step++) {
+        TILE_ENTRY *cached;
+        index = (*cursor + step) % previous_count;
+        cached = &previous[index];
+        if (cached->item != entry->item) continue;
+        if (cached->formats == entry->formats && CompareFileTime(&cached->modified, &entry->modified) == 0) {
+            entry->image = cached->image;
+            entry->image_width = cached->image_width;
+            entry->image_height = cached->image_height;
+            cached->image = NULL;
+        }
+        if (_tcscmp(cached->text, entry->text) == 0) {
+            entry->fit_width = cached->fit_width;
+            entry->fit_height = cached->fit_height;
+            entry->fit_dpi = cached->fit_dpi;
+            entry->fits = cached->fits;
+        }
+        *cursor = index + 1;
+        return;
+    }
 }
 
 static int __cdecl tile_compare_position(void *context, const void *first, const void *second)
@@ -287,11 +360,37 @@ static int __cdecl tile_compare_position(void *context, const void *first, const
         left->left != right->left ? (left->left > right->left ? 1 : -1) : 0;
 }
 
+/*
+ * Whether the entry text word-wrapped to width fits in max_height. A clip text can be 64K characters, and measuring
+ * all of it is what made laying out the clip list slow. A panel shows only a few lines, so a prefix answers the
+ * question: when a prefix already overflows, the whole text does too. The prefix doubles only while it still fits.
+ * The answer is kept in the entry, since every refresh and resize asks the same question again.
+ */
+static BOOL tile_text_fits(HWND window, HDC context, TILE_ENTRY *entry, int width, int max_height)
+{
+    RECT measured;
+    int dpi = (int)GetDpiForWindow(window);
+    int length, prefix;
+    if (entry->fit_width == width && entry->fit_height == max_height && entry->fit_dpi == dpi) return entry->fits;
+    entry->fit_width = width;
+    entry->fit_height = max_height;
+    entry->fit_dpi = dpi;
+    length = lstrlen(entry->text);
+    prefix = min(length, 128);
+    for (;;) {
+        if (prefix < length && IS_HIGH_SURROGATE(entry->text[prefix - 1])) prefix++;
+        SetRect(&measured, 0, 0, max(1, width), 0);
+        DrawText(context, entry->text, prefix, &measured, DT_CALCRECT | DT_WORDBREAK | DT_NOPREFIX);
+        if (measured.bottom > max_height) return entry->fits = FALSE;
+        if (prefix == length) return entry->fits = TRUE;
+        prefix = length - prefix > prefix ? prefix * 2 : length;
+    }
+}
+
 /* Natural tile size: same rules in every layout. text_pad narrows the text measuring area (front badge). */
 static void tile_size(HWND window, HDC context, TILE_ENTRY *entry, int max_width, int text_pad,
     int *out_width, int *out_height, int *out_columns)
 {
-    RECT measured;
     int gap = tile_scale(window, 8);
     int cell = tile_scale(window, 96);
     int block = cell * 2 + gap;
@@ -304,9 +403,7 @@ static void tile_size(HWND window, HDC context, TILE_ENTRY *entry, int max_width
     width = columns * (cell + gap) - gap;
     height = entry->image == NULL ? tile_scale(window, 48) : rows * (cell + gap) - gap;
     while (entry->image == NULL && (height < cell || columns < 4)) {
-        SetRect(&measured, 0, 0, max(1, width - gap * 2 - text_pad), 0);
-        DrawText(context, entry->text, -1, &measured, DT_CALCRECT | DT_WORDBREAK | DT_NOPREFIX);
-        if (measured.bottom <= height - gap * 2) {
+        if (tile_text_fits(window, context, entry, width - gap * 2 - text_pad, height - gap * 2)) {
             break;
         }
         if (height < cell) height = cell;
@@ -349,15 +446,13 @@ static void tile_size(HWND window, HDC context, TILE_ENTRY *entry, int max_width
 static void tile_vertical_text_size(HWND window, HDC context, TILE_ENTRY *entry, int max_width, int text_pad,
     int *out_width, int *out_height)
 {
-    RECT measured;
     int gap = tile_scale(window, 8);
     int cell = tile_scale(window, 96);
     int width = 4 * (cell + gap) - gap;
     int one_line = tile_scale(window, 24);
     *out_width = min(width, max(1, max_width));
-    SetRect(&measured, 0, 0, max(1, *out_width - gap * 2 - text_pad), 0);
-    DrawText(context, entry->text, -1, &measured, DT_CALCRECT | DT_WORDBREAK | DT_NOPREFIX);
-    *out_height = measured.bottom <= one_line - tile_scale(window, 4) ? one_line : cell;
+    *out_height = tile_text_fits(window, context, entry, *out_width - gap * 2 - text_pad, one_line - tile_scale(window, 4)) ?
+        one_line : cell;
 }
 
 static void tile_finish_layout(HWND window, TILE_VIEW *view, const RECT *client)
@@ -783,10 +878,15 @@ void tileview_refresh(HWND window, DATA_INFO *items)
 {
     TILE_VIEW *view = (TILE_VIEW *)GetWindowLongPtr(window, GWLP_USERDATA);
     DATA_INFO *item;
-    int count = 0;
+    TILE_ENTRY *previous;
+    int count = 0, previous_count, cursor = 0;
     if (view == NULL) {
         return;
     }
+    previous = view->entries;
+    previous_count = view->count;
+    view->entries = NULL;
+    view->count = 0;
     tile_clear(view);
     view->selected = -1;
     for (item = items; item != NULL; item = item->next) {
@@ -808,8 +908,13 @@ void tileview_refresh(HWND window, DATA_INFO *items)
                 continue;
             }
             FileTimeToSystemTime(&item->modified, &view->entries[view->count].date);
-            view->entries[view->count].image = tile_preview(window, item,
-                &view->entries[view->count].image_width, &view->entries[view->count].image_height);
+            view->entries[view->count].formats = tile_formats_key(item);
+            view->entries[view->count].modified = item->modified;
+            tile_take_cached(previous, previous_count, &cursor, &view->entries[view->count]);
+            if (view->entries[view->count].image == NULL) {
+                view->entries[view->count].image = tile_preview(window, item,
+                    &view->entries[view->count].image_width, &view->entries[view->count].image_height);
+            }
             if (item->plugin_string != NULL && lstrlen(item->plugin_string) == 17 &&
                 _tcsncmp(item->plugin_string, TEXT("ClipMaster:tile:"), 16) == 0) {
                 view->entries[view->count].kind = item->plugin_string[16] - TEXT('0');
@@ -823,6 +928,7 @@ void tileview_refresh(HWND window, DATA_INFO *items)
             }
         }
     }
+    tile_free_entries(previous, previous_count);
     tile_layout(window, view);
 }
 
@@ -916,8 +1022,8 @@ static void tile_paint(HWND window, TILE_VIEW *view, HDC target)
     HDC context = CreateCompatibleDC(target);
     HDC source = NULL;
     HBITMAP buffer, old_bitmap;
-    HFONT old_font, category_font, large = NULL, label_font = NULL, name_font = NULL;
-    HBRUSH surface, search_surface, category_surfaces[2], divider_surfaces[2];
+    HFONT old_font, category_font, date_font, large = NULL, label_font = NULL, name_font = NULL;
+    HBRUSH surface, search_surface, category_surfaces[CATEGORY_COUNT], divider_surfaces[2];
     HPEN pen, old_pen;
     int index, sequence;
     TCHAR date[64];
@@ -928,11 +1034,13 @@ static void tile_paint(HWND window, TILE_VIEW *view, HDC target)
     FillRect(context, &client, dark_mode_get_brush(COLOR_WINDOW));
     surface = CreateSolidBrush(dark_mode_is_dark() ? dark_mode_get_color(COLOR_BTNFACE) : RGB(248, 248, 248));
     search_surface = CreateSolidBrush(RGB(255, 255, 224));
-    category_surfaces[0] = CreateSolidBrush(RGB(160, 160, 160));
-    category_surfaces[1] = CreateSolidBrush(RGB(88, 88, 88));
+    for (index = 0; index < CATEGORY_COUNT; index++) category_surfaces[index] = CreateSolidBrush(category_colors[index]);
     divider_surfaces[0] = CreateSolidBrush(RGB(184, 134, 11));      /* DarkGoldenrod: the date changes */
     divider_surfaces[1] = CreateSolidBrush(RGB(218, 165, 32));      /* Goldenrod: only AM/PM changes */
     category_font = CreateFont(-tile_scale(window, 14), 0, 0, 0, FW_BOLD,
+        FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+        CLEARTYPE_QUALITY, DEFAULT_PITCH, TEXT("Segoe UI"));
+    date_font = CreateFont(-MulDiv(9, GetDpiForWindow(window), 72), 0, 0, 0, FW_BOLD,
         FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
         CLEARTYPE_QUALITY, DEFAULT_PITCH, TEXT("Segoe UI"));
     pen = CreatePen(PS_SOLID, 1, dark_mode_get_color(COLOR_3DSHADOW));
@@ -976,7 +1084,11 @@ static void tile_paint(HWND window, TILE_VIEW *view, HDC target)
                 entry->date.wHour < 12 ? TEXT("\xC624\xC804") : TEXT("\xC624\xD6C4"));
             if (view->samples) lstrcpy(date, TEXT("Clip samples"));
             SetTextColor(context, dark_mode_get_color(COLOR_WINDOWTEXT));
-            DrawText(context, date, -1, &bounds, DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
+            {
+                HGDIOBJ previous_font = SelectObject(context, date_font);
+                DrawText(context, date, -1, &bounds, DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
+                SelectObject(context, previous_font);
+            }
             {
                 int older;
                 HBRUSH arrow_brush;
@@ -991,7 +1103,7 @@ static void tile_paint(HWND window, TILE_VIEW *view, HDC target)
                 arrow_brush = divider_surfaces[new_day ? 0 : 1];
                 int middle = (bounds.top + bounds.bottom) / 2;
                 int tip_x = bounds.left + tile_scale(window, 100);
-                int head = tile_scale(window, 10), half = tile_scale(window, 5), thick = max(1, tile_scale(window, 1));
+                int head = tile_scale(window, 10), half = tile_scale(window, 5), thick = max(1, tile_scale(window, 1)) + 1;
                 POINT tip[3];
                 RECT shaft;
                 HGDIOBJ previous_pen, previous_brush;
@@ -1016,7 +1128,10 @@ static void tile_paint(HWND window, TILE_VIEW *view, HDC target)
         }
         matched = view->keyword[0] != TEXT('\0') && StrStrI(entry->text, view->keyword) != NULL;
         FillRect(context, &bounds, matched ? search_surface : surface);
-        FrameRect(context, &bounds, dark_mode_get_brush(index == view->selected ? COLOR_HIGHLIGHT : COLOR_3DSHADOW));
+        /* The ClipManager tab (history, both layouts) has no tile border; the selection frame below is drawn on top. */
+        if (view->favorites || view->samples) {
+            FrameRect(context, &bounds, dark_mode_get_brush(index == view->selected ? COLOR_HIGHLIGHT : COLOR_3DSHADOW));
+        }
         text_bounds = bounds;
         InflateRect(&text_bounds, -tile_scale(window, 8),
             bounds.bottom - bounds.top <= tile_scale(window, 24) ? -tile_scale(window, 2) : -tile_scale(window, 8));
@@ -1120,9 +1235,12 @@ static void tile_paint(HWND window, TILE_VIEW *view, HDC target)
         if (show_category) {
             TCHAR label[] = { tile_category(entry->item), TEXT('\0') };
             SaveDC(context);
-            SelectObject(context, category_surfaces[label[0] == TEXT('T') || label[0] == TEXT('R') || label[0] == TEXT('I') ? 0 : 1]);
-            SelectObject(context, GetStockObject(NULL_PEN));
-            Ellipse(context, badge.left, badge.top, badge.right, badge.bottom);
+            if (!draw_circle_smooth(context, badge.left, badge.top, badge.right, badge.bottom,
+                category_colors[tile_category_index(label[0])])) {
+                SelectObject(context, category_surfaces[tile_category_index(label[0])]);
+                SelectObject(context, GetStockObject(NULL_PEN));
+                Ellipse(context, badge.left, badge.top, badge.right, badge.bottom);
+            }
             SelectObject(context, category_font);
             SetTextColor(context, RGB(255, 255, 255));
             DrawText(context, label, -1, &badge, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
@@ -1150,11 +1268,11 @@ static void tile_paint(HWND window, TILE_VIEW *view, HDC target)
     DeleteObject(pen);
     DeleteObject(surface);
     DeleteObject(search_surface);
-    DeleteObject(category_surfaces[0]);
-    DeleteObject(category_surfaces[1]);
+    for (index = 0; index < CATEGORY_COUNT; index++) DeleteObject(category_surfaces[index]);
     DeleteObject(divider_surfaces[0]);
     DeleteObject(divider_surfaces[1]);
     DeleteObject(category_font);
+    DeleteObject(date_font);
     if (large != NULL) DeleteObject(large);
     if (label_font != NULL) DeleteObject(label_font);
     if (name_font != NULL) DeleteObject(name_font);

@@ -196,6 +196,7 @@
     <ClCompile Include="TileView.c" />
     <ClCompile Include="ClipSample.c" />
     <ClCompile Include="ClipEdit.c" />
+    <ClCompile Include="ClipHandler.c" />
     <ClCompile Include="PastePlus.cpp">
       <LanguageStandard>stdcpp17</LanguageStandard>
       <AdditionalIncludeDirectories>$(WindowsSdkDir)Include\$(WindowsTargetPlatformVersion)\cppwinrt;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
@@ -232,6 +233,7 @@
     <ClInclude Include="TileView.h" />
     <ClInclude Include="ClipSample.h" />
     <ClInclude Include="ClipEdit.h" />
+    <ClInclude Include="ClipHandler.h" />
     <ClInclude Include="PastePlus.h" />
     <ClInclude Include="WinClipHistory.h" />
     <ClInclude Include="Hotkey.h" />

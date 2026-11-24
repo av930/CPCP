@@ -32,9 +32,13 @@ extern "C" {
 
 	int save_jpeg(HBITMAP hBmp, LPCWSTR lpszFilename, ULONG uQuality);
 	int save_png(HBITMAP hBmp, LPCWSTR lpszFilename);
+	int save_png_hbitmap(HBITMAP hBmp, LPCWSTR lpszFilename);
+	int save_png_encoded(const BYTE *data, DWORD size, LPCWSTR lpszFilename);
+	int save_png_dib(const BYTE *dib, DWORD size, LPCWSTR lpszFilename);
 
 	HBITMAP image_to_bitmap(HDC hdc, LPCWSTR lpszFilename);
 	HBITMAP image_bytes_to_bitmap(const BYTE *data, DWORD size, int *width, int *height);
+	int draw_circle_smooth(HDC hdc, int left, int top, int right, int bottom, COLORREF color);
 #ifdef __cplusplus
 }
 #endif

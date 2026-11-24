@@ -110,6 +110,101 @@ int save_png(HBITMAP hBmp, LPCWSTR lpszFilename)
 }
 
 /*
+ * gdip_start - GDI+ が未初期化なら一時的に初期化する (FALSE: 初期化に失敗)
+ */
+static BOOL gdip_start(ULONG_PTR *local_token)
+{
+	*local_token = 0;
+	if (gdiplusToken) return TRUE;
+	GdiplusStartupInput startup;
+	return GdiplusStartup(local_token, &startup, NULL) == Ok;
+}
+
+static int gdip_save_png(Gdiplus::Bitmap *image, LPCWSTR lpszFilename)
+{
+	CLSID imageCLSID;
+	if (image == NULL || image->GetLastStatus() != Ok) return 0;
+	CLSIDFromString(L"{557CF406-1A04-11D3-9A73-0000F81EF32E}", &imageCLSID);	//png
+	return image->Save(lpszFilename, &imageCLSID, NULL) == Ok;
+}
+
+/*
+ * save_png_hbitmap - HBITMAPをPNGで保存 (失敗時は 0)
+ */
+int save_png_hbitmap(HBITMAP hBmp, LPCWSTR lpszFilename)
+{
+	ULONG_PTR local_token;
+	int result = 0;
+	if (!gdip_start(&local_token)) return 0;
+	{
+		Gdiplus::Bitmap *image = Gdiplus::Bitmap::FromHBITMAP(hBmp, NULL);
+		result = gdip_save_png(image, lpszFilename);
+		delete image;
+	}
+	if (local_token) GdiplusShutdown(local_token);
+	return result;
+}
+
+/*
+ * save_png_encoded - エンコード済み画像 (JPEG/GIF/TIFF など) をPNGで保存 (失敗時は 0)
+ */
+int save_png_encoded(const BYTE *data, DWORD size, LPCWSTR lpszFilename)
+{
+	HGLOBAL memory = GlobalAlloc(GMEM_MOVEABLE, size);
+	void *buffer = memory ? GlobalLock(memory) : NULL;
+	IStream *stream = NULL;
+	ULONG_PTR local_token;
+	int result = 0;
+	if (buffer == NULL) { if (memory) GlobalFree(memory); return 0; }
+	CopyMemory(buffer, data, size);
+	GlobalUnlock(memory);
+	if (FAILED(CreateStreamOnHGlobal(memory, TRUE, &stream))) { GlobalFree(memory); return 0; }
+	if (gdip_start(&local_token)) {
+		Gdiplus::Bitmap *image = Gdiplus::Bitmap::FromStream(stream, FALSE);
+		result = gdip_save_png(image, lpszFilename);
+		delete image;
+		if (local_token) GdiplusShutdown(local_token);
+	}
+	stream->Release();
+	return result;
+}
+
+/*
+ * save_png_dib - パックDIB (CF_DIB / CF_DIBV5) をPNGで保存 (失敗時は 0)
+ */
+int save_png_dib(const BYTE *dib, DWORD size, LPCWSTR lpszFilename)
+{
+	const BITMAPINFOHEADER *header = (const BITMAPINFOHEADER *)dib;
+	ULONGLONG image_bytes, offset;
+	DWORD colors;
+	HDC context;
+	HBITMAP bitmap;
+	int result;
+	if (size < sizeof(BITMAPINFOHEADER) || header->biSize < sizeof(BITMAPINFOHEADER) || header->biSize > size ||
+		header->biWidth <= 0 || header->biHeight == 0 || header->biHeight == LONG_MIN || header->biPlanes != 1 ||
+		(header->biCompression != BI_RGB && header->biCompression != BI_BITFIELDS)) {
+		return 0;
+	}
+	colors = header->biClrUsed;
+	if (colors == 0 && header->biBitCount <= 8) colors = 1U << header->biBitCount;
+	offset = header->biSize + (ULONGLONG)colors * sizeof(RGBQUAD);
+	if (header->biSize == sizeof(BITMAPINFOHEADER) && header->biCompression == BI_BITFIELDS) offset += 12;
+	image_bytes = ((ULONGLONG)header->biWidth * header->biBitCount + 31) / 32 * 4;
+	image_bytes *= (header->biHeight < 0 ? -header->biHeight : header->biHeight);
+	if (offset > size || image_bytes > size - offset) return 0;
+	/* A DIBV5 that Windows synthesizes from a DIB keeps the 12 byte color masks after the header: the pixels end the data. */
+	if (header->biCompression == BI_BITFIELDS && size - image_bytes > offset && size - image_bytes <= offset + 12)
+		offset = size - image_bytes;
+	context = GetDC(NULL);
+	bitmap = CreateDIBitmap(context, header, CBM_INIT, dib + offset, (const BITMAPINFO *)dib, DIB_RGB_COLORS);
+	ReleaseDC(NULL, context);
+	if (bitmap == NULL) return 0;
+	result = save_png_hbitmap(bitmap, lpszFilename);
+	DeleteObject(bitmap);
+	return result;
+}
+
+/*
  * draw_image_file - 画像ファイルをHBITMAPに変換
  */
 HBITMAP image_bytes_to_bitmap(const BYTE *data, DWORD size, int *width, int *height)
@@ -165,5 +260,19 @@ HBITMAP image_to_bitmap(HDC hdc, LPCWSTR lpszFilename)
 	::SelectObject(mdc, hOldBmp);
 	::DeleteDC(mdc);
 	return hbmp;
+}
+
+/*
+ * draw_circle_smooth - アンチエイリアス付きで円を塗りつぶす (GDI+ 未初期化なら 0 を返す)
+ */
+int draw_circle_smooth(HDC hdc, int left, int top, int right, int bottom, COLORREF color)
+{
+	if (!gdiplusToken) return 0;
+	Gdiplus::Graphics drawing(hdc);
+	Gdiplus::SolidBrush brush(Gdiplus::Color(255, GetRValue(color), GetGValue(color), GetBValue(color)));
+	drawing.SetSmoothingMode(SmoothingModeAntiAlias);
+	drawing.SetPixelOffsetMode(PixelOffsetModeHalf);
+	return drawing.FillEllipse(&brush, (Gdiplus::REAL)left, (Gdiplus::REAL)top,
+		(Gdiplus::REAL)(right - left), (Gdiplus::REAL)(bottom - top)) == Ok;
 }
 /* End of source */

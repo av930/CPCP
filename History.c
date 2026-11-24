@@ -35,6 +35,8 @@ extern OPTION_INFO option;
 static BOOL history_format_equal(DATA_INFO *d1, DATA_INFO *d2);
 static BOOL history_compare(DATA_INFO *d1, DATA_INFO *d2);
 static BOOL history_includes(DATA_INFO *item, DATA_INFO *part);
+static DATA_INFO *history_find_format(DATA_INFO *item, const UINT format, const TCHAR *name);
+static BOOL history_is_duplicate(DATA_INFO *old_item, DATA_INFO *new_item);
 static DATA_INFO **history_find_duplicate(DATA_INFO **root, DATA_INFO *new_item);
 
 /*
@@ -108,6 +110,47 @@ static BOOL history_includes(DATA_INFO *item, DATA_INFO *part)
 }
 
 /*
+ * history_find_format - 形式を検索 (name が NULL でなければ名前、そうでなければ形式番号で一致)
+ */
+static DATA_INFO *history_find_format(DATA_INFO *item, const UINT format, const TCHAR *name)
+{
+	DATA_INFO *di;
+
+	for (di = item->child; di != NULL; di = di->next) {
+		if (name != NULL ? (di->format_name != NULL && lstrcmpi(di->format_name, name) == 0) : di->format == format) {
+			return di;
+		}
+	}
+	return NULL;
+}
+
+/*
+ * history_is_duplicate - 同じ内容のクリップか
+ * 全形式の一致ではなく、クリップの中身を表す形式 (文字列 > ファイル > 画像) だけを比較する。
+ * 他のアプリが付ける形式 (例: Chromium の "source RFH token") はコピーごとに変わるため、含めると重複を見逃す。
+ */
+static BOOL history_is_duplicate(DATA_INFO *old_item, DATA_INFO *new_item)
+{
+	static const struct { UINT format; const TCHAR *name; } keys[] = {
+		{ CF_UNICODETEXT, NULL }, { CF_HDROP, NULL }, { 0, TEXT("PNG") }, { CF_DIBV5, NULL }, { CF_DIB, NULL },
+		{ CF_TIFF, NULL }, { CF_BITMAP, NULL }, { CF_ENHMETAFILE, NULL }, { CF_METAFILEPICT, NULL }, { CF_TEXT, NULL }
+	};
+	int index;
+
+	for (index = 0; index < (int)(sizeof(keys) / sizeof(keys[0])); index++) {
+		DATA_INFO *wanted = history_find_format(new_item, keys[index].format, keys[index].name);
+		DATA_INFO *have;
+
+		if (wanted == NULL) {
+			continue;
+		}
+		have = history_find_format(old_item, keys[index].format, keys[index].name);
+		return (have != NULL && history_format_equal(have, wanted) == TRUE) ? TRUE : FALSE;
+	}
+	return history_compare(old_item, new_item);
+}
+
+/*
  * history_find_duplicate - 履歴の重複アイテムを検索 (見つからなければ NULL)
  */
 static DATA_INFO **history_find_duplicate(DATA_INFO **root, DATA_INFO *new_item)
@@ -119,13 +162,6 @@ static DATA_INFO **history_find_duplicate(DATA_INFO **root, DATA_INFO *new_item)
 	ULARGE_INTEGER now_value;
 	ULARGE_INTEGER item_value;
 
-	for (di = new_item->child; di != NULL; di = di->next) {
-		if (di->format == CF_BITMAP || di->format == CF_DIB || di->format == CF_DIBV5 || di->format == CF_TIFF ||
-			di->format == CF_ENHMETAFILE || di->format == CF_METAFILEPICT ||
-			(di->format_name && (!lstrcmpi(di->format_name, TEXT("PNG")) || !lstrcmpi(di->format_name, TEXT("JFIF")) ||
-			 !lstrcmpi(di->format_name, TEXT("JPEG")) || !lstrcmpi(di->format_name, TEXT("GIF")) ||
-			 !lstrcmpi(di->format_name, TEXT("TIFF"))))) return NULL;
-	}
 	if (*root == NULL || option.config_duplicate_policy == 0) {
 		return NULL;
 	}
@@ -140,9 +176,9 @@ static DATA_INFO **history_find_duplicate(DATA_INFO **root, DATA_INFO *new_item)
 			if (item_value.QuadPart == 0 || item_value.QuadPart > now_value.QuadPart ||
 				now_value.QuadPart - item_value.QuadPart > 864000000000ULL) {
 				continue;
+			}
 		}
-		}
-		if (history_compare(di, new_item) == TRUE) {
+		if (history_is_duplicate(di, new_item) == TRUE) {
 			return link;
 		}
 	}
@@ -159,11 +195,13 @@ static BOOL history_overlap_check(DATA_INFO **root, DATA_INFO *new_item)
 
 /*
  * history_move_duplicate_first - 重複する既存アイテムの日時を更新して先頭へ移動 (重複がなければ FALSE)
+ * 同じ内容の古いクリップが他にもあれば削除し、最新の1件だけを残す。
  */
 BOOL history_move_duplicate_first(DATA_INFO **root, DATA_INFO *new_item)
 {
 	DATA_INFO **link;
 	DATA_INFO *di;
+	DATA_INFO *older;
 
 	if ((link = history_find_duplicate(root, new_item)) == NULL) {
 		return FALSE;
@@ -173,6 +211,12 @@ BOOL history_move_duplicate_first(DATA_INFO **root, DATA_INFO *new_item)
 	data_set_modified(di);
 	di->next = *root;
 	*root = di;
+	while ((link = history_find_duplicate(&di->next, new_item)) != NULL) {
+		older = *link;
+		*link = older->next;
+		older->next = NULL;
+		data_free(older);
+	}
 	return TRUE;
 }
 

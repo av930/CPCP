@@ -379,11 +379,13 @@
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="ClipEdit.c"><Filter>Source Files</Filter></ClCompile>
+    <ClCompile Include="ClipHandler.c"><Filter>Source Files</Filter></ClCompile>
     <ClCompile Include="PastePlus.cpp"><Filter>Source Files</Filter></ClCompile>
     <ClCompile Include="WinClipHistory.cpp"><Filter>Source Files</Filter></ClCompile>
     <ClCompile Include="Hotkey.c"><Filter>Source Files</Filter></ClCompile>
     <ClCompile Include="Config.c"><Filter>Source Files</Filter></ClCompile>
     <ClInclude Include="ClipEdit.h"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="ClipHandler.h"><Filter>Header Files</Filter></ClInclude>
     <ClInclude Include="PastePlus.h"><Filter>Header Files</Filter></ClInclude>
     <ClInclude Include="WinClipHistory.h"><Filter>Header Files</Filter></ClInclude>
     <ClInclude Include="Hotkey.h"><Filter>Header Files</Filter></ClInclude>

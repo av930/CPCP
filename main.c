@@ -1088,44 +1088,90 @@ static BOOL clipboard_to_history(const HWND hWnd)
 	return TRUE;
 }
 
+enum {
+	FORMAT_CATEGORY_NONE,
+	FORMAT_CATEGORY_TEXT,
+	FORMAT_CATEGORY_AUDIO,
+	FORMAT_CATEGORY_IMAGE,
+	FORMAT_CATEGORY_DEVICE,
+	FORMAT_CATEGORY_FILE,
+	FORMAT_CATEGORY_RICHTEXT
+};
+
+/* Which "저장 제외 clip category" setting a clipboard format belongs to (FORMAT_CATEGORY_NONE: metadata or unknown). */
+static int clipboard_format_category(const DATA_INFO *format_item, const UINT rich_text)
+{
+	const TCHAR *name = format_item->format_name;
+
+	if (format_item->format == CF_TEXT || format_item->format == CF_UNICODETEXT || format_item->format == CF_OEMTEXT) {
+		return FORMAT_CATEGORY_TEXT;
+	}
+	if (format_item->format == CF_WAVE || format_item->format == CF_RIFF || (name && StrStrI(name, TEXT("audio/")))) {
+		return FORMAT_CATEGORY_AUDIO;
+	}
+	if (format_item->format == CF_BITMAP || format_item->format == CF_DIB || format_item->format == CF_DIBV5 ||
+		format_item->format == CF_TIFF || format_item->format == CF_PALETTE || format_item->format == CF_ENHMETAFILE ||
+		format_item->format == CF_METAFILEPICT || (name &&
+		(!lstrcmpi(name, TEXT("PNG")) || !lstrcmpi(name, TEXT("JFIF")) || !lstrcmpi(name, TEXT("JPEG")) ||
+		 !lstrcmpi(name, TEXT("GIF")) || !lstrcmpi(name, TEXT("TIFF")) || StrStrI(name, TEXT("image/"))))) {
+		return FORMAT_CATEGORY_IMAGE;
+	}
+	if (format_item->format == CF_DSPBITMAP || format_item->format == CF_DSPENHMETAFILE ||
+		format_item->format == CF_DSPMETAFILEPICT || format_item->format == CF_DSPTEXT ||
+		format_item->format == CF_OWNERDISPLAY) {
+		return FORMAT_CATEGORY_DEVICE;
+	}
+	if (format_item->format == CF_HDROP || (name &&
+		(!lstrcmpi(name, TEXT("FileName")) || !lstrcmpi(name, TEXT("FileNameW")) ||
+		 StrStrI(name, TEXT("FileGroupDescriptor")) || !lstrcmpi(name, TEXT("FileContents")) ||
+		 !lstrcmpi(name, TEXT("Shell IDList Array"))))) {
+		return FORMAT_CATEGORY_FILE;
+	}
+	if (format_item->format == rich_text || (name && (StrStrI(name, TEXT("text/rtf")) ||
+		StrStrI(name, TEXT("text/html")) || !lstrcmpi(name, TEXT("HTML Format"))))) {
+		return FORMAT_CATEGORY_RICHTEXT;
+	}
+	return FORMAT_CATEGORY_NONE;
+}
+
+static BOOL clipboard_format_excluded(const int category)
+{
+	switch (category) {
+	case FORMAT_CATEGORY_TEXT: return option.config_exclude_text != 0;
+	case FORMAT_CATEGORY_AUDIO: return option.config_exclude_audio != 0;
+	case FORMAT_CATEGORY_IMAGE: return option.config_exclude_image != 0;
+	case FORMAT_CATEGORY_DEVICE: return option.config_exclude_device != 0;
+	case FORMAT_CATEGORY_FILE: return option.config_exclude_file != 0;
+	case FORMAT_CATEGORY_RICHTEXT: return option.config_exclude_richtext != 0;
+	}
+	return FALSE;
+}
+
+/*
+ * clipboard_filter_formats - 저장 제외 category の形式を取り除く。保存する価値のある内容が残らなければ FALSE
+ *  - 何かを取り除いた場合: category が判る内容形式 (text/image/file...) が残っている時だけ保存する。
+ *    (Explorer のファイルコピーは File を除外すると DataObjectAttributes / DropDescription 等のメタ情報だけが残る)
+ *  - 何も取り除いていない場合: メタ情報以外の形式が1つでもあれば保存する (独自形式のみのクリップ用)
+ */
 static BOOL clipboard_filter_formats(DATA_INFO *item)
 {
 	DATA_INFO **link = &item->child;
 	DATA_INFO *format_item;
 	UINT rich_text = RegisterClipboardFormat(TEXT("Rich Text Format"));
-	BOOL excluded;
+	int category;
+	BOOL removed = FALSE;
+	BOOL content = FALSE;
 	BOOL payload = FALSE;
 
 	while ((format_item = *link) != NULL) {
-		excluded = (option.config_exclude_text != 0 && (format_item->format == CF_TEXT ||
-			format_item->format == CF_UNICODETEXT || format_item->format == CF_OEMTEXT)) ||
-			(option.config_exclude_audio != 0 && (format_item->format == CF_WAVE || format_item->format == CF_RIFF ||
-			(format_item->format_name && StrStrI(format_item->format_name, TEXT("audio/"))))) ||
-			(option.config_exclude_image != 0 && (format_item->format == CF_BITMAP ||
-			format_item->format == CF_DIB || format_item->format == CF_DIBV5 ||
-			format_item->format == CF_TIFF ||
-			format_item->format == CF_PALETTE || format_item->format == CF_ENHMETAFILE ||
-			format_item->format == CF_METAFILEPICT || (format_item->format_name &&
-			(!lstrcmpi(format_item->format_name, TEXT("PNG")) || !lstrcmpi(format_item->format_name, TEXT("JFIF")) ||
-			 !lstrcmpi(format_item->format_name, TEXT("JPEG")) || !lstrcmpi(format_item->format_name, TEXT("GIF")) ||
-			 !lstrcmpi(format_item->format_name, TEXT("TIFF")) ||
-			 StrStrI(format_item->format_name, TEXT("image/")))))) ||
-			(option.config_exclude_device != 0 && (format_item->format == CF_DSPBITMAP ||
-			format_item->format == CF_DSPENHMETAFILE || format_item->format == CF_DSPMETAFILEPICT ||
-			format_item->format == CF_DSPTEXT || format_item->format == CF_OWNERDISPLAY)) ||
-			(option.config_exclude_file != 0 && (format_item->format == CF_HDROP || (format_item->format_name &&
-			 (!lstrcmpi(format_item->format_name, TEXT("FileName")) || !lstrcmpi(format_item->format_name, TEXT("FileNameW")) ||
-			  StrStrI(format_item->format_name, TEXT("FileGroupDescriptor")) ||
-			  !lstrcmpi(format_item->format_name, TEXT("FileContents")) ||
-			  !lstrcmpi(format_item->format_name, TEXT("Shell IDList Array")))))) ||
-			(option.config_exclude_richtext != 0 && (format_item->format == rich_text ||
-			(format_item->format_name && (StrStrI(format_item->format_name, TEXT("text/rtf")) ||
-			 StrStrI(format_item->format_name, TEXT("text/html")) || !lstrcmpi(format_item->format_name, TEXT("HTML Format"))))));
-		if (excluded != FALSE) {
+		category = clipboard_format_category(format_item, rich_text);
+		if (clipboard_format_excluded(category) != FALSE) {
 			*link = format_item->next;
 			format_item->next = NULL;
 			data_free(format_item);
+			removed = TRUE;
 		} else {
+			if (category != FORMAT_CATEGORY_NONE) content = TRUE;
 			if (format_item->format != CF_LOCALE && !(format_item->format_name &&
 				(StrStrI(format_item->format_name, TEXT("Ole Private")) ||
 				 !lstrcmpi(format_item->format_name, TEXT("DataObject")) ||
@@ -1134,7 +1180,7 @@ static BOOL clipboard_filter_formats(DATA_INFO *item)
 			link = &format_item->next;
 		}
 	}
-	return item->child != NULL && payload;
+	return item->child != NULL && (removed != FALSE ? content : payload);
 }
 
 static BOOL clipboard_is_confidential(DATA_INFO *item)
@@ -1774,6 +1820,21 @@ static BOOL winodw_end(const HWND hWnd)
 }
 
 /*
+ * viewer_show_tab - ホットキーでビューアを表示し、タブを選択する
+ * A new viewer opens on the remembered tab; point that at this tab, so no other tab is built first.
+ */
+static void viewer_show_tab(const HWND hWnd, const int tab)
+{
+	if (hViewerWnd == NULL) {
+		option.config_last_tab = tab;
+	}
+	SendMessage(hWnd, WM_COMMAND, ID_MENUITEM_VIEWER, 1);
+	if (hViewerWnd != NULL) {
+		SendMessage(hViewerWnd, WM_VIEWER_SELECT_TAB, tab, 0);
+	}
+}
+
+/*
  * main_proc - メインウィンドウプロシージャ
  */
 static LRESULT CALLBACK main_proc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
@@ -2188,20 +2249,11 @@ static LRESULT CALLBACK main_proc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPa
 	case WM_HOTKEY:
 		// ホットキー
 		if (wParam == APP_HOTKEY_CLIPMANAGER) {
-			SendMessage(hWnd, WM_COMMAND, ID_MENUITEM_VIEWER, 1);
-			if (hViewerWnd != NULL) {
-				SendMessage(hViewerWnd, WM_VIEWER_SELECT_TAB, 0, 0);
-			}
+			viewer_show_tab(hWnd, 0);
 		} else if (wParam == APP_HOTKEY_FAVORITES) {
-			SendMessage(hWnd, WM_COMMAND, ID_MENUITEM_VIEWER, 1);
-			if (hViewerWnd != NULL) {
-				SendMessage(hViewerWnd, WM_VIEWER_SHOW_FAVORITES, 0, 0);
-			}
+			viewer_show_tab(hWnd, 1);
 		} else if (wParam == APP_HOTKEY_PASTEPLUS) {
-			SendMessage(hWnd, WM_COMMAND, ID_MENUITEM_VIEWER, 1);
-			if (hViewerWnd != NULL) {
-				SendMessage(hViewerWnd, WM_VIEWER_SELECT_TAB, 2, 0);
-			}
+			viewer_show_tab(hWnd, 2);
 		} else if (wParam == APP_HOTKEY_PASTE) {
 			HWND target = GetForegroundWindow();
 			if (history_data.child != NULL && IsWindow(target) && target != hViewerWnd && target != hWnd &&
