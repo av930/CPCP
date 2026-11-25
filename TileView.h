@@ -12,7 +12,6 @@
 #define WM_TILE_SAMPLE (WM_APP + 1146)
 #define WM_TILE_DEBUG_NEW (WM_APP + 1147)
 #define WM_TILE_DEBUG_DELETE (WM_APP + 1148)
-#define WM_TILE_COPY (WM_APP + 1149)
 
 /*
  * Clip panel types. The number in the name orders the panels by height (Y) ascending, then width (X) ascending.

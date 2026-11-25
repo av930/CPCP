@@ -1516,20 +1516,7 @@ static LRESULT CALLBACK tile_proc(HWND window, UINT message, WPARAM parameter, L
         }
         if (parameter == VK_RETURN && view->selected >= 0 && view->selected < view->count) {
             TILE_ENTRY *entry = &view->entries[view->selected];
-            if (!view->favorites) {
-                /* History: copy the clip, i.e. it becomes the newest clip. The list is rebuilt, so find it again. */
-                DATA_INFO *item = entry->item;
-                SendMessage(GetParent(window), WM_TILE_COPY, entry->kind, (LPARAM)item);
-                for (index = 0; index < view->count; index++) {
-                    if (view->entries[index].item == item) {
-                        view->selected = index;
-                        tile_reveal(window, view);
-                        break;
-                    }
-                }
-                InvalidateRect(window, NULL, FALSE);
-                return 0;
-            }
+            if (!view->favorites && !view->samples) return SendMessage(GetParent(window), WM_TILE_PASTE, entry->kind, (LPARAM)entry->item);
             return SendMessage(GetParent(window), view->samples ? (entry->item == NULL ? WM_TILE_DEBUG_NEW : WM_TILE_SAMPLE) :
                 entry->item == NULL ? WM_TILE_NEW : WM_TILE_PASTE, entry->kind, (LPARAM)entry->item);
         }
